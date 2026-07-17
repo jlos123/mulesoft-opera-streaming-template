@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:websocket="http://www.mulesoft.org/schema/mule/websocket"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:anypoint-mq="http://www.mulesoft.org/schema/mule/anypoint-mq"
+      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/anypoint-mq http://www.mulesoft.org/schema/mule/anypoint-mq/current/mule-anypoint-mq.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd
+http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mule/websocket/current/mule-websocket.xsd">
+
+    <configuration-properties doc:name="Configuration properties" file="config.properties" />
+
+    <!--
+      Secrets (OAuth clientId/clientSecret, Application Key, x-app-key, enterpriseId, Anypoint MQ client
+      credentials) resolve via this module as ${secure::name}, decrypted at runtime with a master key
+      passed as the deploy-time system property below. See README for how to populate/encrypt secure.properties
+      from secure.properties.sample.
+    -->
+    <secure-properties:config name="secure-props-config" file="secure.properties" key="${mule.key}" doc:name="Secure Properties config">
+        <secure-properties:encrypt algorithm="Blowfish" mode="CBC" />
+    </secure-properties:config>
+
+    <!-- OAuth token endpoint: POST {host}/oauth/v1/tokens -->
+    <http:request-config name="ohip-oauth-http-config" doc:name="OHIP OAuth HTTP Request config">
+        <http:request-connection host="${ohip.host}" port="${ohip.port}" protocol="${ohip.httpProtocol}">
+            <http:authentication>
+                <http:basic-authentication username="${secure::ohip.clientId}" password="${secure::ohip.clientSecret}" preemptive="true" />
+            </http:authentication>
+        </http:request-connection>
+    </http:request-config>
+
+    <!--
+      The graphql-transport-ws subprotocol has no dedicated connector attribute; verified against the
+      connector's gated Sec-WebSocket-Protocol behavior, it is sent as a plain default header and the
+      server echoes it back during the 101 handshake.
+    -->
+    <websocket:config name="ohip-stream-ws-config" doc:name="OHIP Stream WebSocket config">
+        <websocket:connection>
+            <websocket:client-settings host="${ohip.host}" port="${ohip.port}" basePath="/" protocol="${ohip.wsProtocol}">
+                <websocket:default-headers>
+                    <websocket:header key="Sec-WebSocket-Protocol" value="graphql-transport-ws" />
+                </websocket:default-headers>
+            </websocket:client-settings>
+        </websocket:connection>
+    </websocket:config>
+
+    <os:object-store name="currentSocketOs" persistent="false" doc:name="Current Socket Id (cross-flow)" />
+    <os:object-store name="reconnectStateOs" persistent="false" doc:name="Reconnect Wait State (cross-flow)" />
+    <os:object-store name="tokenStateOs" persistent="false" doc:name="OAuth Token Expiry (cross-flow)" />
+
+    <!--
+      HA (symmetric competing-consumer) cross-flow state. Non-persistent and PER-INSTANCE by design: each
+      instance has its own view of "am I the holder / am I waiting to take over". Coordination between
+      instances happens through OHIP itself (the connection-status query + the 4409 lock), NOT through a
+      shared store - so this must not be persistent/shared. Keys:
+        'ha-subscribed'          (bool)     - true once THIS instance sent the event subscribe and holds the stream
+        'ha-takeover-not-before' (epoch ms) - earliest time this instance may subscribe after seeing status Inactive
+      See ha-failover-flow.xml and the connection_ack / connection-status handlers in connect-flow.xml.
+    -->
+    <os:object-store name="haStateOs" persistent="false" doc:name="HA competing-consumer state (cross-flow)" />
+
+    <!--
+      Persistent (CloudHub 2.0-backed OSv2). entryTtl mirrors Oracle's 7-day Offset retention so an
+      unattended app doesn't accumulate stale state past the point OHIP itself would reject the Offset.
+    -->
+    <os:object-store name="offsetStateOs" persistent="true" entryTtl="7" entryTtlUnit="DAYS" doc:name="Offset + uniqueEventId + lastConnectedAt" />
+
+    <anypoint-mq:config name="ohip-mq-config" doc:name="Anypoint MQ config">
+        <anypoint-mq:connection url="${anypoint.mq.url}" clientId="${secure::anypoint.mq.clientId}" clientSecret="${secure::anypoint.mq.clientSecret}" />
+    </anypoint-mq:config>
+
+</mule>

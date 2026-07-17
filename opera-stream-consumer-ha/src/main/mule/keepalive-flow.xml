@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:websocket="http://www.mulesoft.org/schema/mule/websocket"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mule/websocket/current/mule-websocket.xsd">
+
+    <!--
+      Oracle requires an application-level ping every ~15s; the WebSockets connector has no native
+      ping/pong for graphql-transport-ws (only OS-level TCP keepAlive / connectionIdleTimeout, neither of
+      which sends a protocol frame). Sends nothing (and logs nothing) when no socket is open.
+    -->
+    <flow name="ohip-ping-scheduler-flow" maxConcurrency="1" doc:name="OHIP Ping Scheduler">
+        <scheduler doc:name="Every 15s" doc:description="Fire every 15 seconds to keep the connection alive">
+            <scheduling-strategy>
+                <fixed-frequency frequency="15000" />
+            </scheduling-strategy>
+        </scheduler>
+        <os:contains key="'current-socket-id'" objectStore="currentSocketOs" target="hasSocket" doc:name="Has current socket?" doc:description="Check for an active socket" />
+        <choice doc:name="If socket open" doc:description="Only ping if a socket is actually open">
+            <when expression="#[vars.hasSocket]" doc:description="A socket is open, so send the keepalive ping">
+                <os:retrieve key="'current-socket-id'" objectStore="currentSocketOs" target="socketId" doc:name="Retrieve current socket id" doc:description="Load the active socket ID" />
+                <websocket:send socketId="#[vars.socketId]" config-ref="ohip-stream-ws-config" doc:name="Send ping" doc:description="Send a keepalive ping to Opera">
+                    <websocket:content>#[output application/json --- {'type': "ping"}]</websocket:content>
+                </websocket:send>
+            </when>
+            <otherwise>
+                <logger level="DEBUG" doc:name="No socket open, skip ping" doc:description="Skip the ping since no socket is open" message="No Stream socket open; skipping ping." />
+            </otherwise>
+        </choice>
+    </flow>
+
+</mule>

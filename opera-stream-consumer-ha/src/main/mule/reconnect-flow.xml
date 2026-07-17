@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:websocket="http://www.mulesoft.org/schema/mule/websocket"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:java="http://www.mulesoft.org/schema/mule/java"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/java http://www.mulesoft.org/schema/mule/java/current/mule-java.xsd
+http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mule/websocket/current/mule-websocket.xsd">
+
+    <!--
+     We call getOriginalCode() via the Java module on the raw enum BEFORE that coercion, then route on the resulting int.
+    -->
+    <flow name="ohip-on-socket-closed-flow" maxConcurrency="1" doc:name="OHIP On Socket Closed">
+        <websocket:on-socket-closed path="/subscriptions" config-ref="ohip-stream-ws-config" doc:name="On Socket Closed" doc:description="Trigger when Opera closes the connection" />
+        <java:invoke doc:name="Read numeric close code"
+                     instance="#[payload.code]"
+                     class="org.mule.runtime.http.api.ws.WebSocketCloseCode"
+                     method="getOriginalCode()"
+                     target="closeCode" doc:description="Reads the Opera provided socket close code"/>
+        <!-- Guarded remove: on-socket-closed can fire for a socket that never wrote current-socket-id
+             (e.g. one rejected by the Single-Consumer Lock), so an unconditional remove throws OS:KEY_NOT_FOUND. -->
+        <os:contains key="'current-socket-id'" objectStore="currentSocketOs" target="hasCurrentSocket" doc:name="Has current socket id?" doc:description="Check whether this socket was the tracked one" />
+        <choice doc:name="Clear current socket id if present" doc:description="Clear the tracked socket only if it was this one">
+            <when expression="#[vars.hasCurrentSocket]" doc:description="This closed socket was the tracked one, so clear the stored socket id">
+                <os:remove key="'current-socket-id'" objectStore="currentSocketOs" doc:name="Clear current socket id" doc:description="Remove the now-dead socket ID" />
+            </when>
+        </choice>
+        <!--
+          HA: the socket that just closed carried our status probe and/or our live subscription, so all
+          HA state keyed to it is now stale. Clearing ha-subscribed re-arms the failover poller to probe
+          and (re)take over; clearing the pending/scheduled markers avoids acting on the dead socket. All
+          guarded (os:remove throws OS:KEY_NOT_FOUND on a missing key) and harmless when ha.enabled=false.
+        -->
+        <os:contains key="'ha-subscribed'" objectStore="haStateOs" target="hadHaSubscribed" doc:name="Was HA-active?" doc:description="Did this instance hold the stream" />
+        <choice doc:name="Clear ha-subscribed if present"><when expression="#[vars.hadHaSubscribed]" doc:description="We held the stream, so clear the flag to re-arm the failover poller"><os:remove key="'ha-subscribed'" objectStore="haStateOs" doc:name="Clear ha-subscribed" doc:description="No longer holding the stream" /></when></choice>
+        <os:contains key="'ha-takeover-not-before'" objectStore="haStateOs" target="hadTakeoverSched" doc:name="Takeover scheduled?" doc:description="Was a takeover queued on the dead socket" />
+        <choice doc:name="Clear ha-takeover if present"><when expression="#[vars.hadTakeoverSched]" doc:description="A takeover was queued on the now-dead socket, so cancel it"><os:remove key="'ha-takeover-not-before'" objectStore="haStateOs" doc:name="Clear ha-takeover-not-before" doc:description="Stale after socket drop" /></when></choice>
+        <os:contains key="'offset-record'" objectStore="offsetStateOs" target="hasOffsetRecord" doc:name="Has stored Offset record?" doc:description="Check for a saved Offset" />
+        <choice doc:name="Update lastConnectedAt if record exists" doc:description="Record when the connection last dropped">
+            <when expression="#[vars.hasOffsetRecord]" doc:description="A saved Offset exists, so stamp it with the disconnect time">
+                <os:retrieve key="'offset-record'" objectStore="offsetStateOs" target="offsetRecord" doc:name="Retrieve Offset record" doc:description="Load the saved Offset" />
+                <os:store key="'offset-record'" objectStore="offsetStateOs" doc:name="Update lastConnectedAt only" doc:description="Timestamp the disconnect">
+                    <os:value><![CDATA[#[vars.offsetRecord ++ {lastConnectedAt: now() as String}]]]></os:value>
+                </os:store>
+            </when>
+        </choice>
+        <choice doc:name="Route by close code (originalCode)" doc:description="Decide how to react based on why the socket closed">
+            <when expression="#[vars.closeCode == 4401]" doc:description="Token expired/invalid, so reconnect immediately with a fresh token">
+                <logger level="INFO" doc:name="Log 4401" doc:description="Log that the token expired" message="Token expired/invalid (4401); fetching new token and reconnecting." />
+                <flow-ref name="connect-subflow" doc:name="Reconnect now" doc:description="Reconnect immediately with a fresh token" />
+            </when>
+            <when expression="#[vars.closeCode == 4403]" doc:description="Chain not enabled / bad chainCode, so halt and stop retrying (config problem)">
+                <logger level="ERROR" doc:name="Log 4403 halt" doc:description="Log a fatal configuration error and stop retrying"
+                        message="Chain not enabled / bad chainCode (4403) - halting, this is a configuration problem. Not retrying." />
+            </when>
+            <when expression="#[vars.closeCode == 4409]" doc:description="Another consumer holds the lock, so reconnect after a 2min+jitter backoff">
+                <logger level="INFO" doc:name="Log 4409" doc:description="Log that another consumer already holds the connection"
+                        message="Single-Consumer Lock held (4409); scheduling reconnect after wait+jitter." />
+                <set-variable variableName="reconnectWaitMs"
+                              value="#[p('ohip.reconnect.wait4409Ms') as Number + (random() * (p('ohip.reconnect.wait4409JitterMaxMs') as Number))]"
+                              doc:name="Compute wait (2min + jitter)" doc:description="Wait ~2 minutes plus jitter before retrying" />
+                <flow-ref name="schedule-reconnect-subflow" doc:name="Schedule reconnect" doc:description="Queue up the reconnect attempt" />
+            </when>
+            <when expression="#[vars.closeCode == 4504]" doc:description="Service timeout, so reconnect after a short 15s wait">
+                <logger level="INFO" doc:name="Log 4504" doc:description="Log a service timeout" message="Service timeout (4504); scheduling reconnect after 15s." />
+                <set-variable variableName="reconnectWaitMs" value="#[p('ohip.reconnect.wait4504Ms') as Number]" doc:name="Compute wait (15s)" doc:description="Wait 15 seconds before retrying" />
+                <flow-ref name="schedule-reconnect-subflow" doc:name="Schedule reconnect" doc:description="Queue up the reconnect attempt" />
+            </when>
+            <when expression="#[vars.closeCode == 1006]" doc:description="Abnormal closure, so reconnect after a brief 4s wait">
+                <logger level="INFO" doc:name="Log 1006" doc:description="Log an abnormal closure" message="Abnormal closure (1006); scheduling reconnect after 4s." />
+                <set-variable variableName="reconnectWaitMs" value="#[p('ohip.reconnect.wait1006Ms') as Number]" doc:name="Compute wait (4s)" doc:description="Wait 4 seconds before retrying" />
+                <flow-ref name="schedule-reconnect-subflow" doc:name="Schedule reconnect" doc:description="Queue up the reconnect attempt" />
+            </when>
+            <otherwise>
+                <logger level="INFO" doc:name="Log default close" doc:description="Log a routine close"
+                        message="Close code #[vars.closeCode] (e.g. 1000/1001); scheduling immediate reconnect." />
+                <set-variable variableName="reconnectWaitMs" value="#[p('ohip.reconnect.waitDefaultMs') as Number]" doc:name="Compute wait (0ms)" doc:description="Reconnect right away" />
+                <flow-ref name="schedule-reconnect-subflow" doc:name="Schedule reconnect" doc:description="Queue up the reconnect attempt" />
+            </otherwise>
+        </choice>
+    </flow>
+    <sub-flow name="schedule-reconnect-subflow" doc:name="Schedule Reconnect">
+        <set-variable variableName="reconnectNotBeforeEpochMs"
+                      value="#[(now() as Number {unit: 'milliseconds'}) + vars.reconnectWaitMs]"
+                      doc:name="Compute not-before timestamp" doc:description="Work out the earliest retry time" />
+        <os:store key="'reconnect-not-before-epoch-ms'" objectStore="reconnectStateOs" doc:name="Store not-before timestamp" doc:description="Save the earliest retry time">
+            <os:value><![CDATA[#[vars.reconnectNotBeforeEpochMs]]]></os:value>
+        </os:store>
+        <os:store key="'reconnect-pending'" objectStore="reconnectStateOs" doc:name="Store reconnect-pending flag" doc:description="Mark a reconnect as pending">
+            <os:value><![CDATA[#[true]]]></os:value>
+        </os:store>
+    </sub-flow>
+
+    <flow name="reconnect-scheduler-flow" maxConcurrency="1" doc:name="Reconnect Scheduler">
+        <scheduler doc:name="Reconnect poll" doc:description="Poll for a due reconnect on the configured interval">
+            <scheduling-strategy>
+                <fixed-frequency frequency="${ohip.reconnect.schedulerPollMs}" />
+            </scheduling-strategy>
+        </scheduler>
+        <os:contains key="'reconnect-pending'" objectStore="reconnectStateOs" target="hasPending" doc:name="Has pending reconnect?" doc:description="Check if a reconnect is queued" />
+        <os:contains key="'connect-in-progress'" objectStore="currentSocketOs" target="connecting" doc:name="Connect already in progress?" doc:description="Check if a connect attempt is already running" />
+        <choice doc:name="If pending and due and not already connecting" doc:description="Only act if a reconnect is queued and nothing else is connecting">
+            <when expression="#[vars.hasPending and not vars.connecting]" doc:description="A reconnect is queued and nothing else is connecting, so check if it's due">
+                <os:retrieve key="'reconnect-not-before-epoch-ms'" objectStore="reconnectStateOs" target="notBeforeEpochMs" doc:name="Retrieve not-before timestamp" doc:description="Load the earliest allowed retry time" />
+                <choice doc:name="If due now" doc:description="Wait until the retry time has actually arrived">
+                    <when expression="#[(now() as Number {unit: 'milliseconds'}) &gt;= vars.notBeforeEpochMs]" doc:description="The backoff wait has elapsed, so attempt the reconnect now">
+                        <logger level="INFO" doc:name="Log reconnecting" doc:description="Log that the wait is over and reconnecting now" message="Reconnect wait elapsed; reconnecting now." />
+                        <!--
+                          Clear the pending flag ONLY on a successful connect. If connect-subflow throws (token
+                          endpoint down, socket refused), the flag stays set and we push the not-before timestamp
+                          out by one poll interval so the scheduler retries instead of wedging permanently.
+                        -->
+                        <try doc:name="Attempt reconnect" doc:description="Try to reconnect, retrying later on failure">
+                            <flow-ref name="connect-subflow" doc:name="Reconnect now" doc:description="Reopen the connection to Opera" />
+                            <os:remove key="'reconnect-pending'" objectStore="reconnectStateOs" doc:name="Clear reconnect-pending flag (success)" doc:description="Reconnect succeeded, clear the pending flag" />
+                            <os:remove key="'reconnect-not-before-epoch-ms'" objectStore="reconnectStateOs" doc:name="Clear not-before timestamp (success)" doc:description="Clean up the retry timestamp" />
+                            <error-handler>
+                                <on-error-continue doc:name="Connect failed - keep pending, back off one interval" doc:description="Reconnect failed, so try again on the next tick">
+                                    <logger level="WARN" doc:name="Log reconnect failure" doc:description="Log why the reconnect attempt failed"
+                                            message="Reconnect attempt failed (#[error.description]); leaving pending and retrying next interval." />
+                                    <os:store key="'reconnect-not-before-epoch-ms'" objectStore="reconnectStateOs" doc:name="Push not-before out one interval" doc:description="Delay the next retry attempt">
+                                        <os:value><![CDATA[#[(now() as Number {unit: 'milliseconds'}) + (p('ohip.reconnect.schedulerPollMs') as Number)]]]></os:value>
+                                    </os:store>
+                                </on-error-continue>
+                            </error-handler>
+                        </try>
+                    </when>
+                </choice>
+            </when>
+        </choice>
+    </flow>
+
+</mule>

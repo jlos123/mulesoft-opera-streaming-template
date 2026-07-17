@@ -1,0 +1,11 @@
+# Sample secrets (plaintext, dummy values) for the Secure Configuration Properties module.
+# Copy to secure.properties, fill in real values, then encrypt with the module's CLI/tooling using a
+# master key of your own. NEVER commit the real (post-fill-in) file - only this .sample stays in git.
+# See README for the encryption steps and secure.properties.encrypted.sample for the encrypted form.
+ohip.clientId=sample-oauth-client-id
+ohip.clientSecret=sample-oauth-client-secret
+# One Application Key per OHIP app - sent raw as the x-app-key header on the token + REST calls.
+ohip.appKey=sample-application-key
+ohip.enterpriseId=sample-enterprise-id
+anypoint.mq.clientId=sample-anypoint-mq-client-id
+anypoint.mq.clientSecret=sample-anypoint-mq-client-secret

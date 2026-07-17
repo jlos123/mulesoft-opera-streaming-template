@@ -1,0 +1,81 @@
+{
+  "folders": [
+    {
+      "path": "opera-stream-consumer"
+    },
+    {
+      "path": "opera-stream-consumer-ha"
+    },
+    {
+      "path": "opera-event-orchestrator"
+    }
+  ],
+  "settings": {
+    "files.exclude": {
+      "**/.git": true,
+      "**/.svn": true,
+      "**/.hg": true,
+      "**/.DS_Store": true,
+      "**/Thumbs.db": true,
+      "**/target": true,
+      "**/.mule": true,
+      ".mule": true
+    }
+  },
+  "extensions": {},
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "type": "mule-xml-debugger",
+        "request": "launch",
+        "name": "Run Both Apps",
+        "noDebug": true,
+        "mule.projects": [
+          "${workspaceFolder:opera-stream-consumer}",
+          "${workspaceFolder:opera-event-orchestrator}"
+        ],
+        "mule.runtime.version": "4.10.5",
+        "mule.jdk.version": "17",
+        "mule.runtime.args": "${config:mule.runtime.defaultArguments} -M-Dmule.key=mulesoft -M-Danypoint.mq.subscriber.backpressure.enabled=true"
+      },
+      {
+        "type": "mule-xml-debugger",
+        "request": "launch",
+        "name": "Debug Both Apps",
+        "noDebug": false,
+        "mule.projects": [
+          "${workspaceFolder:opera-stream-consumer}",
+          "${workspaceFolder:opera-event-orchestrator}"
+        ],
+        "mule.runtime.version": "4.10.5",
+        "mule.jdk.version": "17",
+        "mule.runtime.args": "${config:mule.runtime.defaultArguments} -M-Dmule.key=mulesoft -M-Danypoint.mq.subscriber.backpressure.enabled=true"
+      },
+      {
+        "type": "mule-xml-debugger",
+        "request": "launch",
+        "name": "HA: Run instance A",
+        "noDebug": true,
+        "mule.projects": [
+          "${workspaceFolder:opera-stream-consumer-ha}"
+        ],
+        "mule.runtime.version": "4.10.5",
+        "mule.jdk.version": "17",
+        "mule.runtime.args": "${config:mule.runtime.defaultArguments} -M-Dmule.key=mulesoft -M-Dohip.ha.enabled=true"
+      },
+      {
+        "type": "mule-xml-debugger",
+        "request": "launch",
+        "name": "HA: Run instance B (identical - competes for the same lock)",
+        "noDebug": true,
+        "mule.projects": [
+          "${workspaceFolder:opera-stream-consumer-ha}"
+        ],
+        "mule.runtime.version": "4.10.5",
+        "mule.jdk.version": "17",
+        "mule.runtime.args": "${config:mule.runtime.defaultArguments} -M-Dmule.key=mulesoft -M-Dohip.ha.enabled=true"
+      }
+    ]
+  }
+}

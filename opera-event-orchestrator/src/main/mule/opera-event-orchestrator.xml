@@ -1,0 +1,324 @@
+<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:anypoint-mq="http://www.mulesoft.org/schema/mule/anypoint-mq" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation" xmlns:os="http://www.mulesoft.org/schema/mule/os" xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/anypoint-mq http://www.mulesoft.org/schema/mule/anypoint-mq/current/mule-anypoint-mq.xsd http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd  http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+	http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+	http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!--
+      Fetches an OHIP OAuth token via client-credentials, mirroring the producer's fetch-oauth-token-subflow.
+      Preemptive basic-auth (clientId/clientSecret) is OOTB on ohip-oauth-http-config; the x-app-key header -
+      which OHIP's token endpoint REQUIRES and the OOTB OAuth module cannot inject - is added here. Token +
+      expiry are cached in tokenStateOs so we only refresh when expired (getProfile/getReservation run per
+      event; re-fetching a token per event would be its own rate-limit problem). Token value is never logged.
+    -->
+    <sub-flow name="fetch-oauth-token-subflow" doc:name="Fetch OHIP OAuth Token">
+        <!-- The x-app-key header value IS the Application Key (one OHIP credential). -->
+        <set-variable variableName="xAppKey" value="${secure::ohip.appKey}" doc:name="Load x-app-key (secure)" doc:description="Load the x-app-key credential" />
+        <set-variable variableName="enterpriseId" value="${secure::ohip.enterpriseId}" doc:name="Load enterpriseId (secure)" doc:description="Load the enterprise ID credential" />
+        <http:request method="POST" path="/oauth/v1/tokens" config-ref="ohip-oauth-http-config" doc:name="POST /oauth/v1/tokens" doc:description="Request a fresh OAuth token from Opera">
+            <http:body><![CDATA[#[
+                "grant_type=client_credentials&scope=" ++ p('ohip.oauthScope')
+            ]]]></http:body>
+            <http:headers><![CDATA[#[{
+                "x-app-key": vars.xAppKey,
+                "Content-Type": "application/x-www-form-urlencoded"
+            } ++ (if (isEmpty(vars.enterpriseId)) {} else {"enterpriseId": vars.enterpriseId})]]]></http:headers>
+        </http:request>
+        <os:store key="'ohip-access-token'" objectStore="tokenStateOs" doc:name="Cache access token (cross-flow)" doc:description="Save the token for reuse across events">
+            <os:value><![CDATA[#[payload.access_token]]]></os:value>
+        </os:store>
+        <os:store key="'token-expires-at-epoch-ms'" objectStore="tokenStateOs" doc:name="Cache token expiry" doc:description="Save when the token will expire">
+            <os:value><![CDATA[#[(now() as Number {unit: 'milliseconds'}) + ((payload.expires_in as Number) * 1000)]]]></os:value>
+        </os:store>
+        <logger level="INFO" doc:name="Log token obtained (redacted)" doc:description="Confirm a token was issued, without exposing it"
+                message="OHIP OAuth token obtained (expires_in=#[payload.expires_in]s); token value redacted" />
+    </sub-flow>
+
+    <!--
+      Returns a valid Bearer token in vars.accessToken, refreshing only if the cached one is missing or expires
+      within 60s. tokenStateOs is non-persistent (in-memory)
+    -->
+    <sub-flow name="ensure-oauth-token-subflow" doc:name="Ensure OHIP OAuth Token">
+        <!--
+          Load x-app-key HERE (not only in fetch): fetch runs only when the token is refreshed, but the REST
+          calls need x-app-key on EVERY event. Setting it here guarantees vars.xAppKey is populated on the
+          cached-token path too - otherwise getProfile/getReservation would send x-app-key: null and 401.
+        -->
+        <set-variable variableName="xAppKey" value="${secure::ohip.appKey}" doc:name="Load x-app-key (secure)" doc:description="Load the x-app-key credential for the REST calls" />
+        <os:retrieve key="'token-expires-at-epoch-ms'" objectStore="tokenStateOs" target="tokenExpiresAt" doc:name="Load cached token expiry" doc:description="Read when the cached token expires">
+            <os:default-value><![CDATA[#[0]]]></os:default-value>
+        </os:retrieve>
+        <choice doc:name="Refresh token if expired/expiring" doc:description="Fetch a new token only when needed">
+            <when expression="#[(vars.tokenExpiresAt as Number) - (now() as Number {unit: 'milliseconds'}) &lt; 60000]" doc:description="Cached token is missing or expires within 60s, so fetch a fresh one">
+                <flow-ref name="fetch-oauth-token-subflow" doc:name="fetch-oauth-token-subflow" doc:description="Get a fresh OAuth token" />
+            </when>
+        </choice>
+        <os:retrieve key="'ohip-access-token'" objectStore="tokenStateOs" target="accessToken" doc:name="Load cached access token" doc:description="Read the current Bearer token" />
+    </sub-flow>
+
+    <!--
+      maxConcurrency = plain parallelism now (order no longer matters under orchestration). Tune
+      ${ohip.mq.consumerConcurrency} to whichever binds first: backend write capacity or OHIP REST rate limits.
+    -->
+    <flow doc:name="Orchestration Consumer" maxConcurrency="${ohip.mq.consumerConcurrency}" name="Orchestration-Consumer">
+        <anypoint-mq:subscriber acknowledgementMode="MANUAL" config-ref="ohip-mq-config" destination="${ohip.mq.consumerDestination}" doc:name="Subscribe to Business Events queue" doc:description="Trigger on event receipt">
+            <anypoint-mq:subscriber-type>
+                <anypoint-mq:polling>
+                    <scheduling-strategy>
+                        <fixed-frequency frequency="1000" />
+                    </scheduling-strategy>
+                </anypoint-mq:polling>
+            </anypoint-mq:subscriber-type>
+            <!--
+              CIRCUIT BREAKER for OHIP-outage. When the orchestration re-fetch keeps failing
+              because OHIP REST is DOWN (connectivity/timeout/5xx), tripping this breaker halts MQ polling
+              for the cooldown instead of nack-looping every event toward the DLQ. It is scoped to
+              DEPENDENCY OUTAGE (transient, affects ALL messages), NOT per-message poison - poison still
+              nacks->DLQ via the catch-all handler below.
+            -->
+            <anypoint-mq:circuit-breaker
+                errorsThreshold="${ohip.mq.cb.errorsThreshold}"
+                tripTimeout="${ohip.mq.cb.tripTimeout}"
+                tripTimeoutUnit="${ohip.mq.cb.tripTimeoutUnit}"
+                onErrorTypes="${ohip.mq.cb.onErrorTypes}" />
+        </anypoint-mq:subscriber>
+        <try doc:name="Orchestrate (fetch current state, upsert; DLQ on failure)" doc:description="Re-fetch current resource state and upsert it">
+            <!-- MQ body arrives as an application/json String; parse once and reuse. -->
+            <set-variable doc:name="Parse Business Event JSON" value="#[read(payload, 'application/json')]" variableName="businessEvent" mimeType="application/json" doc:description="Parse the queued event body" />
+            <flow-ref name="ensure-oauth-token-subflow" doc:name="Ensure OHIP OAuth Token" doc:description="Get a valid Bearer token" />
+            <try doc:name="Fetch current resource state (404 = deleted)" doc:description="GET the latest resource; treat 404 as a delete">
+                <choice doc:name="Route by moduleName" doc:description="Pick the OHIP REST resource for this event">
+                    <!--
+                      PROFILE events (NEW PROFILE / UPDATE PROFILE): primaryKey is the profileId.
+                      getProfile = GET /crm/v1/profiles/{profileId} (chain-level, so no hotelId in the path).
+                      x-hotelid is a REQUIRED OHIP header (crm.json marks it required:true), even though a
+                      chain-level PROFILE event may carry no hotelId. Send the event's hotelId, else the
+                      configured ohip.rest.profileHotelId fallback - never omit the header (omitting it 400s).
+                      fetchInstructions selects which profile sections OHIP returns; without it the response is
+                      sparse (no emails/telephones/memberships). Tune the list in config.properties.
+                    -->
+                    <when expression="#[upper(vars.businessEvent.moduleName default '') == 'PROFILE']" doc:description="Profile event, so GET the current profile state from OHIP">
+                        <http:request method="GET" path="/crm/v1/profiles/{profileId}" config-ref="ohip-rest-http-config" target="currentResource" doc:name="getProfile" doc:description="Fetch current profile state">
+                            <http:headers><![CDATA[#[{
+                                "Authorization": "Bearer " ++ vars.accessToken,
+                                "x-app-key": vars.xAppKey,
+                                "x-hotelid": (vars.businessEvent.hotelId default p('ohip.rest.profileHotelId')),
+                                "Accept": "application/json"
+                            }]]]></http:headers>
+                            <http:uri-params><![CDATA[#[{ profileId: vars.businessEvent.primaryKey }]]]></http:uri-params>
+                            <http:query-params><![CDATA[#[{( (p('ohip.rest.profileFetchInstructions') splitBy ",") map {fetchInstructions: trim($)} )}]]]></http:query-params>
+                        </http:request>
+                        <ee:transform doc:name="Transform" doc:id="cfqvyf" doc:description="Example profile transformation">
+                            <ee:message >
+                                <ee:set-payload doc:name="Set payload" doc:id="dshbxq" ><![CDATA[%dw 2.0
+// =====================================================================================================
+// EXAMPLE — accessing getProfile fields in a Transform Message
+// -----------------------------------------------------------------------------------------------------
+// Source call : GET /crm/v1/profiles/{profileId}   (operationId getProfile, crm.json)
+// Response    : the `profile` definition. Field paths below are taken verbatim from crm.json:
+//                 profile
+//                   .profileIdList[]            (uniqueID_Type: {id, type, idExtension})
+//                   .profileDetails            (profileType)
+//                       .customer              (customerType)
+//                           .personName[]      (personNameType: givenName, surname, namePrefix, ...)
+//                           .gender/.birthDate/.language/.nationality/.vipStatus
+//                       .emails.emailInfo[]    (emailInfoType -> email.emailAddress, email.primaryInd)
+//                       .telephones.telephoneInfo[] (telephoneInfoType -> telephone.phoneNumber, ...)
+//                       .profileType           (enum: Guest | Company | Agent | Group | Source | ...)
+//                       .statusCode            (enum: Active | Inactive)
+//                       .createDateTime / .lastModifyDateTime
+//
+// How to use: at the [PLUG-IN] point in opera-event-orchestrator.xml the getProfile body is in
+//             `vars.currentResource`. Put this script in a <ee:transform>. If you instead transform
+//             inline right after the http:request (no target), replace `vars.currentResource` with `payload`.
+//
+// ponytail: emails / telephones / addresses / memberships etc. are populated ONLY when the matching
+//           getProfile `fetchInstructions` query param is sent (Communication, Address, Membership, ...).
+//           Without them OHIP returns a sparse profile, so every deep path here is null-safe (default []/null).
+// =====================================================================================================
+output application/json
+// Alias the deep path once so the mapping below stays readable. `.` navigation is null-safe in DataWeave:
+// if `profileDetails` is missing, `p.customer.gender` is just null rather than an error.
+var p = vars.currentResource.profileDetails
+---
+{
+    // profileIdList[0].id is the OPERA internal profileId echoed back; fall back to the event's primaryKey.
+    profileId: vars.currentResource.profileIdList[0].id default vars.businessEvent.primaryKey,
+    profileType: p.profileType,          // Guest | Company | Agent | ...
+    status: p.statusCode,                // Active | Inactive
+
+    // personName is an array (max 5: primary, alternate-language, ...). `default []` = safe map when absent.
+    names: (p.customer.personName default []) map (n) -> {
+        title:  n.namePrefix,
+        first:  n.givenName,
+        middle: n.middleName,
+        last:   n.surname
+    },
+
+    // Contacts come wrapped in a collection. filter to the primary-flagged entry, take the first ([0]).
+    // (`== true` keeps this null-safe: a bare boolean field in filter throws when the flag is absent.)
+    primaryEmail: ((p.emails.emailInfo default []) filter ($.email.primaryInd == true))[0].email.emailAddress,
+    primaryPhone: ((p.telephones.telephoneInfo default []) filter ($.telephone.primaryInd == true))[0].telephone.phoneNumber,
+
+    demographics: {
+        gender:      p.customer.gender,
+        birthDate:   p.customer.birthDate,      // "YYYY-MM-DD"
+        nationality: p.customer.nationality,
+        vipStatus:   p.customer.vipStatus
+    },
+
+    audit: {
+        createdAt: p.createDateTime,
+        updatedAt: p.lastModifyDateTime
+    }
+}
+]]></ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+                    </when>
+                    <!--
+                      RESERVATION event with NO hotelId: hotelId is in the getReservation PATH, so it cannot be
+                      fetched. Fail explicitly to DLQ rather than firing a GET with an empty path segment.
+                    -->
+                    <when expression="#[upper(vars.businessEvent.moduleName default '') == 'RESERVATION' and isEmpty(vars.businessEvent.hotelId)]" doc:description="Reservation event with no hotelId, so fail it to the DLQ (hotelId is required in the path)">
+                        <raise-error type="APP:MISSING_HOTEL_ID" description="#['RESERVATION event ' ++ (vars.businessEvent.metadata.uniqueEventId default '(no id)') ++ ' has no hotelId; getReservation requires it in the path.']" doc:name="Reservation missing hotelId -> DLQ" />
+                    </when>
+                    <!--
+                      RESERVATION events (e.g. UPDATE RESERVATION): primaryKey is the reservationId.
+                      getReservation = GET /rsv/v1/hotels/{hotelId}/reservations/{reservationId}.
+                    -->
+                    <when expression="#[upper(vars.businessEvent.moduleName default '') == 'RESERVATION']" doc:description="Reservation event, so GET the current reservation state from OHIP">
+                        <!--
+                          fetchInstructions selects which reservation sections OHIP returns; without it the response
+                          is sparse (no roomRates/reservationGuests/totals). Tune the list in config.properties.
+                        -->
+                        <http:request method="GET" path="/rsv/v1/hotels/{hotelId}/reservations/{reservationId}" config-ref="ohip-rest-http-config" target="currentResource" doc:name="getReservation" doc:description="Fetch current reservation state">
+                            <http:headers><![CDATA[#[{
+                                "Authorization": "Bearer " ++ vars.accessToken,
+                                "x-app-key": vars.xAppKey,
+                                "x-hotelid": vars.businessEvent.hotelId,
+                                "Accept": "application/json"
+                            }]]]></http:headers>
+                            <http:uri-params><![CDATA[#[{ hotelId: vars.businessEvent.hotelId, reservationId: vars.businessEvent.primaryKey }]]]></http:uri-params>
+                            <http:query-params><![CDATA[#[{( (p('ohip.rest.reservationFetchInstructions') splitBy ",") map {fetchInstructions: trim($)} )}]]]></http:query-params>
+                        </http:request>
+                        <ee:transform doc:name="Transform" doc:id="wcfdwu" doc:description="Example reservation transformation">
+                            <ee:message >
+                                <ee:set-payload doc:name="Set payload" doc:id="cukhxd" ><![CDATA[%dw 2.0
+// =====================================================================================================
+// EXAMPLE — accessing getReservation fields in a Transform Message
+// -----------------------------------------------------------------------------------------------------
+// Source call : GET /rsv/v1/hotels/{hotelId}/reservations/{reservationId}  (operationId getReservation, rsv.json)
+// Response    : the `reservation` definition — a COLLECTION wrapper even for a single id. Paths from rsv.json:
+//                 reservation
+//                   .reservations.reservation[]            (hotelReservationType)
+//                       .reservationIdList[]               (uniqueID_Type: {id, type, idExtension})
+//                       .hotelId
+//                       .reservationStatus                 (enum: Reserved | InHouse | CheckedOut | Cancelled | ...)
+//                       .roomStay                          (roomStayType)
+//                           .arrivalDate / .departureDate
+//                           .guestCounts.adults/.children  (guestCountsType)
+//                           .currentRoomInfo.roomType/.roomId (currentRoomInfoType)
+//                           .total                          (totalType: amountBeforeTax, amountAfterTax, currencyCode)
+//                           .roomRates[]                    (roomRateType: ratePlanCode, roomType, start, end, total)
+//                       .reservationGuests[]               (resGuestType)
+//                           .primary
+//                           .profileInfo.profileIdList[]    (uniqueID_Type)
+//                           .profileInfo.profile.customer.personName[] (same customerType as CRM)
+//                       .createDateTime / .lastModifyDateTime
+//
+// How to use: at the [PLUG-IN] point the getReservation body is in `vars.currentResource`. The single
+//             reservation is reservations.reservation[0]. Use `payload` instead if you transform inline.
+//
+// ponytail: roomRates, reservationGuests, totals, packages etc. are populated ONLY when the matching
+//           getReservation `fetchInstructions` are sent (Reservation, RateInfoDetails, DailySummary, ...).
+//           Without them the response is sparse — every deep path here is null-safe (default []/null).
+// =====================================================================================================
+output application/json
+// The response is a COLLECTION wrapper even for one id; alias the single reservation once. `.` navigation
+// is null-safe, so deep reads below yield null (not an error) when a section wasn't fetched.
+var r = vars.currentResource.reservations.reservation[0]
+---
+{
+    reservationId: r.reservationIdList[0].id default vars.businessEvent.primaryKey,
+    hotelId:       r.hotelId default vars.businessEvent.hotelId,
+    status:        r.reservationStatus,     // Reserved | InHouse | CheckedOut | Cancelled | ...
+
+    stay: {
+        arrival:        r.roomStay.arrivalDate,     // "YYYY-MM-DD"
+        departure:      r.roomStay.departureDate,
+        adults:         r.roomStay.guestCounts.adults,
+        children:       r.roomStay.guestCounts.children,
+        roomType:       r.roomStay.currentRoomInfo.roomType,
+        roomNumber:     r.roomStay.currentRoomInfo.roomId,
+        // roomStay.total (totalType): amounts are Numbers, currencyCode is ISO 4217.
+        totalBeforeTax: r.roomStay.total.amountBeforeTax,
+        totalAfterTax:  r.roomStay.total.amountAfterTax,
+        currency:       r.roomStay.total.currencyCode
+    },
+
+    // roomRates[] — one entry per rate-plan / room-type / date-range combination.
+    rates: (r.roomStay.roomRates default []) map (rr) -> {
+        ratePlan:       rr.ratePlanCode,
+        roomType:       rr.roomType,
+        from:           rr.start,
+        to:             rr.end,
+        amountAfterTax: rr.total.amountAfterTax,
+        currency:       rr.total.currencyCode
+    },
+
+    // reservationGuests[] -> profileInfo.profile.customer.personName[] (same customerType as the CRM profile).
+    guests: (r.reservationGuests default []) map (g) -> {
+        primary:   g.primary default false,
+        profileId: g.profileInfo.profileIdList[0].id,
+        first:     g.profileInfo.profile.customer.personName[0].givenName,
+        last:      g.profileInfo.profile.customer.personName[0].surname
+    },
+
+    audit: {
+        createdAt: r.createDateTime,
+        updatedAt: r.lastModifyDateTime
+    }
+}
+]]></ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+                    </when>
+                    <otherwise>
+                        <raise-error type="APP:UNSUPPORTED_EVENT" description="#['No orchestration route for moduleName=' ++ (vars.businessEvent.moduleName default '(null)')]" doc:name="Unsupported event -> DLQ" />
+                    </otherwise>
+                </choice>
+                <!-- ========================= DEVELOPER PLUG-IN POINT ========================= -->
+                <!--
+                  Reached only on a successful GET: vars.currentResource holds the LATEST resource state.
+                -->
+                <logger level="INFO" doc:name="[PLUG-IN] Upsert current resource" doc:description="Stand-in for your idempotent backend upsert"
+                        message="[UPSERT] Replace with backend write: eventName=#[vars.businessEvent.eventName] module=#[vars.businessEvent.moduleName] primaryKey=#[vars.businessEvent.primaryKey] uniqueEventId=#[vars.businessEvent.metadata.uniqueEventId]" />
+                <error-handler>
+                    <!--
+                      404 = the resource was deleted between the event and our fetch. Under orchestration that is
+                      the DELETE signal: map it to a backend delete (plug-in point), NOT an error. HTTP:NOT_FOUND
+                      is what the connector raises on a 404 response.
+                    -->
+                    <on-error-continue type="HTTP:NOT_FOUND" doc:name="404 -> delete" doc:description="Treat a missing resource as a delete">
+                        <logger level="INFO" doc:name="[PLUG-IN] Delete resource" doc:description="Stand-in for your backend delete"
+                                message="[DELETE] Resource gone (404) - replace with backend delete: module=#[vars.businessEvent.moduleName] primaryKey=#[vars.businessEvent.primaryKey]" />
+                    </on-error-continue>
+                </error-handler>
+            </try>
+            <anypoint-mq:ack ackToken="#[attributes.ackToken]" config-ref="ohip-mq-config" doc:name="Ack on success" doc:description="Confirm the event was processed" />
+            <error-handler>
+                <on-error-propagate type="${ohip.mq.cb.onErrorTypes}" doc:name="OHIP down -> nack + propagate (feeds circuit breaker)" doc:description="Return the event and let the breaker count the outage">
+                    <logger level="WARN" doc:name="Log OHIP outage" doc:description="Log that OHIP appears unreachable"
+                            message="OHIP re-fetch failed (outage - nack + propagate, feeds circuit breaker): #[error.errorType.namespace]:#[error.errorType.identifier] - #[error.description]" />
+                    <anypoint-mq:nack ackToken="#[attributes.ackToken]" config-ref="ohip-mq-config" doc:name="Nack (return to queue)" doc:description="Return the event to the queue for redelivery" />
+                </on-error-propagate>
+
+                <on-error-continue doc:name="Nack on failure (poison -> DLQ after redelivery)" doc:description="Return the event to the queue for redelivery">
+                    <logger level="WARN" doc:name="Log processing failure" doc:description="Log why the event failed"
+                            message="Orchestration failed (nack -> redeliver/DLQ): #[error.description]" />
+                    <anypoint-mq:nack ackToken="#[attributes.ackToken]" config-ref="ohip-mq-config" doc:name="Nack" doc:description="Return the event to the queue for redelivery" />
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+</mule>

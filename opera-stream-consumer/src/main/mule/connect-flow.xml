@@ -1,0 +1,271 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:websocket="http://www.mulesoft.org/schema/mule/websocket"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:anypoint-mq="http://www.mulesoft.org/schema/mule/anypoint-mq"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/anypoint-mq http://www.mulesoft.org/schema/mule/anypoint-mq/current/mule-anypoint-mq.xsd
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mule/websocket/current/mule-websocket.xsd">
+
+    <!--
+      Fetches an OAuth token per Oracle's client-credentials flow. Redacts the token value from logs
+      (only expires_in is logged) since access_token is a secret.
+    -->
+    <sub-flow name="fetch-oauth-token-subflow" doc:name="Fetch OAuth Token">
+        <!-- ${secure::...} resolved into variables here; DataWeave/p() do not resolve the secure:: prefix. -->
+        <!-- The x-app-key header value IS the Application Key (one OHIP credential); same ohip.appKey used raw here and SHA-256-hashed for the ?key= handshake param below. -->
+        <set-variable variableName="xAppKey" value="${secure::ohip.appKey}" doc:name="Load x-app-key (secure)" doc:description="Load the x-app-key credential" />
+        <set-variable variableName="enterpriseId" value="${secure::ohip.enterpriseId}" doc:name="Load enterpriseId (secure)" doc:description="Load the enterprise ID credential" />
+        <http:request method="POST" path="/oauth/v1/tokens" config-ref="ohip-oauth-http-config" doc:name="POST /oauth/v1/tokens" doc:description="Request a fresh OAuth token from Opera">
+            <http:body><![CDATA[#[
+                "grant_type=client_credentials&scope=" ++ p('ohip.oauthScope')
+            ]]]></http:body>
+            <http:headers><![CDATA[#[{
+                "x-app-key": vars.xAppKey,
+                "Content-Type": "application/x-www-form-urlencoded"
+            } ++ (if (isEmpty(vars.enterpriseId)) {} else {"enterpriseId": vars.enterpriseId})]]]></http:headers>
+        </http:request>
+        <ee:transform doc:name="Extract token fields" doc:description="Pull the access token and expiry out of the response">
+            <ee:variables>
+                <ee:set-variable variableName="accessToken"><![CDATA[%dw 2.0
+output application/java
+---
+payload.access_token]]></ee:set-variable>
+                <ee:set-variable variableName="tokenExpiresIn"><![CDATA[%dw 2.0
+output application/java
+---
+payload.expires_in]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        <logger level="INFO" doc:name="Log token obtained (redacted)" doc:description="Confirm a token was issued, without exposing it"
+                message="OAuth token obtained (expires_in=#[vars.tokenExpiresIn]s); token value redacted" />
+        <os:store key="'token-expires-at-epoch-ms'" objectStore="tokenStateOs" doc:name="Store token expiry (cross-flow, for proactive refresh)" doc:description="Save when the token will expire">
+            <os:value><![CDATA[#[(now() as Number {unit: 'milliseconds'}) + (vars.tokenExpiresIn as Number * 1000)]]]></os:value>
+        </os:store>
+    </sub-flow>
+
+    <!--
+      Shared connect-subflow: fetch token, open the Stream socket, send connection_init. Reused by the
+      tracer bullet, the reconnect state machine, and proactive token refresh.
+    -->
+    <sub-flow name="connect-subflow" doc:name="Connect Subflow">
+        <!--
+          Mark connect in-progress up front. connect-subflow only writes 'current-socket-id' at the very end
+          (after connection_init), so without this marker a scheduler firing mid-connect sees "no socket" and
+          launches a SECOND connect - which OHIP rejects with the Single-Consumer Lock (4409) and force-closes
+          the in-flight socket. The startup/reconnect guards skip while this marker is set. Always cleared in
+          the error handler so a failed connect can't wedge the marker on.
+        -->
+        <os:store key="'connect-in-progress'" objectStore="currentSocketOs" doc:name="Mark connect in-progress" doc:description="Flag that a connection attempt is underway">
+            <os:value><![CDATA[#[true]]]></os:value>
+        </os:store>
+        <try doc:name="Connect (clear in-progress marker on any outcome)" doc:description="Run the connect steps, clearing the in-progress flag either way">
+        <flow-ref name="fetch-oauth-token-subflow" doc:name="Fetch OAuth Token" doc:description="Get a fresh OAuth token" />
+        <set-variable variableName="appKey" value="${secure::ohip.appKey}" doc:name="Load Application Key (secure)" doc:description="Load the Application Key credential" />
+        <!--
+          dw::Crypto::hashWith takes Binary and returns Binary (raw digest bytes), NOT a hex string.
+          Oracle's ?key= requires lowercase hex, so coerce input to Binary, hash, hex-encode, lowercase -
+          exactly what the built-in Crypto::SHA1/MD5 helpers do internally (toHex(content hashWith ...)).
+        -->
+        <set-variable variableName="appKeyHash" value="#[lower(dw::core::Binaries::toHex(dw::Crypto::hashWith(vars.appKey as Binary, 'SHA-256')))]" doc:name="Hash Application Key (SHA-256 -> lowercase hex)" doc:description="Hash the Application Key for the socket URL" />
+        <set-variable variableName="subscriptionId" value="#[uuid()]" doc:name="Set subscription id" doc:description="Generate a unique subscription ID" />
+        <os:contains key="'offset-record'" objectStore="offsetStateOs" target="hasOffsetRecord" doc:name="Has stored Offset record?" doc:description="Check whether a saved Offset exists" />
+        <choice doc:name="Load Offset record if present" doc:description="Resume from a saved Offset, or start fresh">
+            <when expression="#[vars.hasOffsetRecord]" doc:description="A saved Offset exists, so load it to resume from where we left off">
+                <os:retrieve key="'offset-record'" objectStore="offsetStateOs" target="offsetRecord" doc:name="Retrieve Offset record" doc:description="Load the last saved Offset" />
+            </when>
+            <otherwise>
+                <set-variable variableName="offsetRecord" value="#[null]" doc:name="No Offset record (first run)" doc:description="Mark this as a first-time connection" />
+            </otherwise>
+        </choice>
+        <ee:transform doc:name="Resolve gap-based subscribe input" doc:description="Build the subscribe payload from the Offset">
+            <ee:variables>
+                <ee:set-variable variableName="subscribeInput" resource="dw/resolve-subscribe-input.dwl" />
+            </ee:variables>
+        </ee:transform>
+        <choice doc:name="Warn if Offset expired (&gt;7d gap)" doc:description="Flag an Offset that's too old to safely resume from">
+            <when expression="#[vars.hasOffsetRecord and (not (vars.subscribeInput.offset?))
+                                and (((now() as Number {unit: 'milliseconds'}) - (vars.offsetRecord.lastConnectedAt as DateTime as Number {unit: 'milliseconds'})) &gt; (7 * 24 * 60 * 60 * 1000))]"
+                  doc:description="Stored Offset is older than 7 days, so warn that events were likely missed">
+                <logger level="WARN" doc:name="Log Offset expired" doc:description="Warn that events were likely missed"
+                        message="Offset expired (gap &gt;7d since lastConnectedAt=#[vars.offsetRecord.lastConnectedAt]); Business Events were likely missed. Subscribing fresh." />
+            </when>
+        </choice>
+        <!--
+          Persist subscription id + resolved subscribe input BEFORE opening the socket. The connection_ack
+          that triggers the subscribe is handled in a SEPARATE flow (ohip-stream-intake-flow) whose event has
+          its own empty vars, so these must be shared via the object store, not flow vars. Stored pre-open so
+          they're guaranteed available by the time connection_ack arrives.
+        -->
+        <os:store key="'subscription-id'" objectStore="currentSocketOs" doc:name="Store subscription id (cross-flow)" doc:description="Share the subscription ID with other flows">
+            <os:value><![CDATA[#[vars.subscriptionId]]]></os:value>
+        </os:store>
+        <os:store key="'subscribe-input'" objectStore="currentSocketOs" doc:name="Store subscribe input (cross-flow)" doc:description="Share the subscribe payload with other flows">
+            <os:value><![CDATA[#[vars.subscribeInput]]]></os:value>
+        </os:store>
+        <websocket:open-outbound-socket path="/subscriptions" config-ref="ohip-stream-ws-config" socketId="ohip-stream"
+                                         target="streamSocketAttributes" targetValue="#[attributes]"
+                                         doc:name="Open Stream WebSocket" doc:description="Open the connection to Opera's event stream">
+            <websocket:query-params><![CDATA[#[{key: vars.appKeyHash}]]]></websocket:query-params>
+        </websocket:open-outbound-socket>
+        <logger level="INFO" doc:name="Log WebSocket opened" doc:description="Confirm the Stream socket is open"
+                message="WebSocket opened (socketId=#[vars.streamSocketAttributes.socketId]); sending connection_init" />
+        <!--
+          Frame content uses an `output application/json` script (the connector's own JSON-send idiom, see
+          its ws-send-config.xml test), not the write() function. write() returns a String, which the content
+          binding then re-serializes to JSON, double-encoding the frame into a quoted string the server
+          cannot parse (observed against the simulator as type=undefined then a 4408 init timeout).
+        -->
+        <websocket:send socketId="#[vars.streamSocketAttributes.socketId]" config-ref="ohip-stream-ws-config" doc:name="Send connection_init" doc:description="Authenticate the new socket connection">
+            <websocket:content><![CDATA[#[output application/json --- {
+                'type': "connection_init",
+                payload: {
+                    Authorization: "Bearer " ++ vars.accessToken,
+                    "x-app-key": vars.appKey
+                }
+            }]]]></websocket:content>
+        </websocket:send>
+        <os:store key="'current-socket-id'" objectStore="currentSocketOs" doc:name="Store current socket id (cross-flow)" doc:description="Record the live socket ID">
+            <os:value><![CDATA[#[vars.streamSocketAttributes.socketId]]]></os:value>
+        </os:store>
+            <!-- Clear the marker as the LAST step of the success path (inside the try). -->
+            <os:remove key="'connect-in-progress'" objectStore="currentSocketOs" doc:name="Clear connect in-progress (success)" doc:description="Clear the connecting flag now that we're live" />
+            <error-handler>
+                <on-error-continue doc:name="Clear in-progress marker on failure" doc:description="Clean up the connecting flag after a failed attempt">
+                    <os:remove key="'connect-in-progress'" objectStore="currentSocketOs" doc:name="Clear connect in-progress (failure)" doc:description="Clear the connecting flag" />
+                    <logger level="WARN" doc:name="Log connect failure" doc:description="Log why the connect attempt failed" message="connect-subflow failed: #[error.description]" />
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </sub-flow>
+
+    <!--
+      Startup / self-heal connect: opens the Stream on deploy, and re-opens if the socket is ever gone
+      without a pending reconnect (belt-and-braces alongside reconnect-flow.xml). A short startDelay lets
+      all configs initialize first. Guarded by currentSocketOs so it never opens a second Stream while one
+      is live (which OHIP would reject with the Single-Consumer Lock, 4409).
+    -->
+    <flow name="ohip-startup-connect-flow" maxConcurrency="1" doc:name="OHIP Startup Connect">
+        <scheduler doc:name="Ensure connected" doc:description="Check every 30 seconds that the stream is connected">
+            <scheduling-strategy>
+                <fixed-frequency frequency="30000" startDelay="2000" />
+            </scheduling-strategy>
+        </scheduler>
+        <os:contains key="'current-socket-id'" objectStore="currentSocketOs" target="hasSocket" doc:name="Has live socket?" doc:description="Check for an active socket" />
+        <os:contains key="'connect-in-progress'" objectStore="currentSocketOs" target="connecting" doc:name="Connect already in progress?" doc:description="Check if a connect attempt is already running" />
+        <os:contains key="'reconnect-pending'" objectStore="reconnectStateOs" target="hasPending" doc:name="Reconnect already pending?" doc:description="Check if a reconnect is already scheduled" />
+        <choice doc:name="Connect if idle" doc:description="Connect only when nothing else is already trying to">
+            <when expression="#[not vars.hasSocket and not vars.connecting and not vars.hasPending]" doc:description="Nothing is connected or connecting, so open the stream on startup">
+                <logger level="INFO" doc:name="Startup connecting" doc:description="Log that startup is opening a new connection" message="No live Stream and no pending reconnect; connecting." />
+                <flow-ref name="connect-subflow" doc:name="connect-subflow" doc:description="Open the connection" />
+            </when>
+        </choice>
+    </flow>
+
+    <!--
+      Ordered, single-threaded intake per Oracle's single-consumer processing rule (maxConcurrency="1").
+      Routes each frame by its graphql-transport-ws "type".
+    -->
+    <flow name="ohip-stream-intake-flow" maxConcurrency="1" doc:name="OHIP Stream Intake">
+        <websocket:outbound-listener path="/subscriptions" config-ref="ohip-stream-ws-config" doc:name="On Stream Frame" doc:description="Trigger on Opera event" outputMimeType="application/json"/>
+        <!-- The socket id comes from the source's own attributes; flow vars from connect-subflow are NOT in scope here. -->
+        <set-variable variableName="socketId" value="#[attributes.socketId]" doc:name="Capture socket id from source" doc:description="Note which socket this frame came from" />
+        <choice doc:name="Route by frame type" doc:description="Handle the frame differently based on its type">
+            <when expression="#[payload.'type' == 'connection_ack']" doc:description="Server accepted the connection, so send the event subscribe">
+                <logger level="INFO" doc:name="Log connection_ack" doc:description="Log that Opera accepted the connection" message="connection_ack received; sending subscribe" />
+                <!-- subscription id + subscribe input were stashed by connect-subflow; retrieve for this event. -->
+                <os:retrieve key="'subscription-id'" objectStore="currentSocketOs" target="subscriptionId" doc:name="Retrieve subscription id" doc:description="Load the subscription ID for this connection" />
+                <os:retrieve key="'subscribe-input'" objectStore="currentSocketOs" target="subscribeInput" doc:name="Retrieve subscribe input" doc:description="Load the subscribe payload for this connection" />
+                <ee:transform doc:name="Build subscribe frame" doc:description="Build the subscribe request frame">
+                    <ee:message>
+                        <ee:set-payload resource="dw/subscribe-frame.dwl" />
+                    </ee:message>
+                </ee:transform>
+                <!-- payload is already application/json (from subscribe-frame.dwl); send verbatim, no re-encode. -->
+                <websocket:send socketId="#[vars.socketId]" config-ref="ohip-stream-ws-config" doc:name="Send subscribe" doc:description="Subscribe to Opera Business Events">
+                    <websocket:content>#[payload]</websocket:content>
+                </websocket:send>
+            </when>
+            <when expression="#[payload.'type' == 'next']" doc:description="This is a Business Event, so publish it and checkpoint the Offset">
+                <set-variable variableName="businessEvent" value="#[payload.payload.data.newEvent]" doc:name="Capture Business Event" doc:description="Pull the Business Event out of the frame" mimeType="application/json"/>
+                <logger level="INFO" doc:name="Log Business Event" doc:description="Log the event name and offset received"
+                        message='Business Event received: Event Name=#[vars.businessEvent.eventName] offset=#[vars.businessEvent.metadata.offset]' />
+                <!--
+                  Commit the Offset on durable enqueue, not on backend processing. Publish first,
+                  then store - a buffered-but-unprocessed event survives a crash because it already lives in
+                  Anypoint MQ, so this ordering does not risk event loss. Offset stored as an opaque String
+                  (never parsed as a Number - it can overflow and doesn't reliably progress by +1).
+                -->
+                <!--
+                  ORCHESTRATION MODE: publishes to a STANDARD queue, not FIFO. Under orchestration the consumer
+                  re-fetches current resource state on every event, so message ORDER no longer affects correctness
+                  (a stale/reordered event just re-reads the same latest state). We therefore drop messageGroupId
+                  (a FIFO-only param - meaningless on a standard queue) and gain standard-queue throughput, which
+                  Oracle/our optimization notes flag as the single biggest throughput win. See the design notes.
+                  messageId=uniqueEventId is KEPT: it costs nothing and lets the consumer optionally skip a
+                  redundant REST fetch for a duplicate (dedup is now an optimization, not a correctness guarantee).
+                  For the strict-order/dedup design that used a FIFO exchange, see branch: exactly-once-ordered.
+                -->
+                <anypoint-mq:publish destination="${ohip.mq.destination}" config-ref="ohip-mq-config"
+                    doc:name="Publish Business Event to Anypoint MQ" doc:description="Hand the event off to Anypoint MQ" messageId="#[vars.businessEvent.metadata.uniqueEventId]">
+                    <anypoint-mq:body>#[write(vars.businessEvent, "application/json")]</anypoint-mq:body>
+                </anypoint-mq:publish>
+                <!--
+                  Checkpoint the Offset PERIODICALLY (every ohip.offset.persistEveryNEvents events), not per
+                  event. The per-event write to the persistent (OSv2, remote) store was the throughput ceiling on
+                  this maxConcurrency=1 path - a network hop, serialized, once per Business Event. The event is
+                  already durably in Anypoint MQ (published above), so a crash between checkpoints never loses
+                  events: it replays from the last checkpointed Offset, and the <=N-event overlap is tolerated by
+                  the consumer's idempotent current-state upsert (re-applying the latest state is a no-op).
+                  messageId=uniqueEventId only preserves an optional dedup hook, not a correctness requirement.
+                  The counter lives in the in-memory (non-persistent) store, so
+                  the per-event cost is a local read+write, not a network round-trip. Set persistEveryNEvents=1 to
+                  restore per-event durability. Offset still stored as an opaque String.
+                -->
+                <os:retrieve key="'events-since-persist'" objectStore="currentSocketOs" target="eventsSincePersist" doc:name="Load events-since-persist counter" doc:description="Events seen since the last durable checkpoint">
+                    <os:default-value><![CDATA[#[0]]]></os:default-value>
+                </os:retrieve>
+                <choice doc:name="Checkpoint Offset every N events" doc:description="Flush the Offset to durable storage on the Nth event">
+                    <when expression="#[(vars.eventsSincePersist + 1) &gt;= (p('ohip.offset.persistEveryNEvents') as Number)]" doc:description="Nth event reached, so durably checkpoint the Offset and reset the counter">
+                        <os:store key="'offset-record'" objectStore="offsetStateOs" doc:name="Checkpoint Offset + uniqueEventId + lastConnectedAt" doc:description="Durably save the Offset now that N events are queued">
+                            <os:value><![CDATA[#[{
+                                offset: vars.businessEvent.metadata.offset as String,
+                                uniqueEventId: vars.businessEvent.metadata.uniqueEventId as String,
+                                lastConnectedAt: now() as String
+                            }]]]></os:value>
+                        </os:store>
+                        <os:store key="'events-since-persist'" objectStore="currentSocketOs" doc:name="Reset checkpoint counter" doc:description="Reset the since-checkpoint counter">
+                            <os:value><![CDATA[#[0]]]></os:value>
+                        </os:store>
+                    </when>
+                    <otherwise>
+                        <os:store key="'events-since-persist'" objectStore="currentSocketOs" doc:name="Increment checkpoint counter" doc:description="Count this event toward the next checkpoint">
+                            <os:value><![CDATA[#[vars.eventsSincePersist + 1]]]></os:value>
+                        </os:store>
+                    </otherwise>
+                </choice>
+            </when>
+            <when expression="#[payload.'type' == 'ping']" doc:description="Server sent a keepalive ping, so reply with a pong">
+                <!--
+                  Server-initiated ping/pong is separate from our own client-initiated ping (keepalive-flow.xml).
+                  Backpressure note: during high-volume bursts a delayed pong is NOT proof the connection is
+                  dead - continued "next" frames are proof of life. No missed-pong timeout is implemented here.
+                -->
+                <websocket:send socketId="#[vars.socketId]" config-ref="ohip-stream-ws-config" doc:name="Reply pong" doc:description="Reply to Opera's keepalive ping">
+                    <websocket:content>#[output application/json --- {'type': "pong"}]</websocket:content>
+                </websocket:send>
+            </when>
+            <otherwise>
+                <logger level="DEBUG" doc:name="Log ignored frame" doc:description="Log any frame type we don't act on" message="Ignored frame type: #[payload.'type']" />
+            </otherwise>
+        </choice>
+    </flow>
+
+</mule>

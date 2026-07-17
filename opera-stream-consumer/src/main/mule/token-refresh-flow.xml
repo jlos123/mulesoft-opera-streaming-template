@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:websocket="http://www.mulesoft.org/schema/mule/websocket"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mule/websocket/current/mule-websocket.xsd">
+
+    <!--
+      Refreshes the OAuth token before it expires so the Stream reconnects gracefully instead of hitting a
+      4401. Sends complete, then reuses reconnect-flow.xml's schedule-reconnect-subflow / reconnect-scheduler-flow
+      to honor the 10s minimum gap between complete and the next subscribe before connect-subflow re-fetches
+      a fresh token. The reactive 4401 path in reconnect-flow.xml remains as a safety net; this scheduler only
+      handles the expected case.
+    -->
+    <flow name="proactive-token-refresh-scheduler-flow" maxConcurrency="1" doc:name="Proactive Token Refresh Scheduler">
+        <scheduler doc:name="Every 30s" doc:description="Check every 30 seconds if the token is about to expire">
+            <scheduling-strategy>
+                <fixed-frequency frequency="${ohip.tokenRefresh.checkIntervalMs}" />
+            </scheduling-strategy>
+        </scheduler>
+        <os:contains key="'token-expires-at-epoch-ms'" objectStore="tokenStateOs" target="hasExpiry" doc:name="Has token expiry?" doc:description="Check whether a token expiry is being tracked" />
+        <choice doc:name="If expiry tracked and due" doc:description="Only act if the token's expiry is known">
+            <when expression="#[vars.hasExpiry]" doc:description="We know when the current token expires, so check whether it's time to refresh">
+                <os:retrieve key="'token-expires-at-epoch-ms'" objectStore="tokenStateOs" target="expiresAtEpochMs" doc:name="Retrieve token expiry" doc:description="Load when the token expires" />
+                <choice doc:name="If within lead time of expiry" doc:description="Refresh only once the token is close to expiring">
+                    <when expression="#[(now() as Number {unit: 'milliseconds'}) &gt;= (vars.expiresAtEpochMs - (p('ohip.tokenRefresh.leadTimeMs') as Number))]" doc:description="Token is within its lead time of expiring, so start a proactive refresh">
+                        <os:remove key="'token-expires-at-epoch-ms'" objectStore="tokenStateOs" doc:name="Clear token expiry (avoid re-triggering)" doc:description="Clear the expiry so this doesn't refire" />
+                        <os:contains key="'current-socket-id'" objectStore="currentSocketOs" target="hasSocket" doc:name="Has current socket?" doc:description="Check for an active socket" />
+                        <choice doc:name="If socket open" doc:description="Only refresh if a socket is actually open">
+                            <when expression="#[vars.hasSocket]" doc:description="A live socket exists, so gracefully complete it and schedule a reconnect with a fresh token">
+                                <os:retrieve key="'current-socket-id'" objectStore="currentSocketOs" target="socketId" doc:name="Retrieve current socket id" doc:description="Load the active socket ID" />
+                                <!-- subscription id is cross-flow state; read from the store (flow vars are empty in this scheduler event). -->
+                                <os:retrieve key="'subscription-id'" objectStore="currentSocketOs" target="subscriptionId" doc:name="Retrieve subscription id" doc:description="Load the active subscription ID" />
+                                <logger level="INFO" doc:name="Log proactive refresh" doc:description="Log that the token is about to expire and a refresh is starting"
+                                        message="Token nearing expiry; sending complete and scheduling refresh+reconnect." />
+                                <websocket:send socketId="#[vars.socketId]" config-ref="ohip-stream-ws-config" doc:name="Send complete" doc:description="Gracefully end the current subscription">
+                                    <websocket:content>#[output application/json --- {id: vars.subscriptionId, 'type': "complete"}]</websocket:content>
+                                </websocket:send>
+                                <set-variable variableName="reconnectWaitMs" value="#[p('ohip.tokenRefresh.completeToSubscribeGapMs') as Number]"
+                                              doc:name="Compute wait (10s complete-to-subscribe gap)" doc:description="Wait 10 seconds before resubscribing" />
+                                <flow-ref name="schedule-reconnect-subflow" doc:name="Schedule reconnect" doc:description="Queue up the reconnect with a fresh token" />
+                            </when>
+                        </choice>
+                    </when>
+                </choice>
+            </when>
+        </choice>
+    </flow>
+
+</mule>

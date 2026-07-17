@@ -1,0 +1,26 @@
+# Root .gitignore — serves the private monorepo AND is copied to the public repo by publish.sh.
+# Only NEVER-TRACK things live here (real secrets, build output, OS/IDE cruft).
+# What stays PRIVATE vs. what goes PUBLIC is decided by the allowlist in publish.sh, not here.
+
+# --- Build output ---
+**/target/
+**/.mule/
+*.class
+*.jar
+*.war
+*.ear
+velocity.log
+
+# --- Real secrets (only the *.sample pair is ever tracked) ---
+**/src/main/resources/secure.properties
+
+# --- Node (the OHIP simulator) ---
+**/node_modules/
+
+# --- OS / IDE cruft ---
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+*~.nib
+.tooling-project/

@@ -1,0 +1,9 @@
+# secure.properties.sample encrypted with the MuleSoft Secure Properties Tool (Blowfish/CBC, matching
+# global.xml's <secure-properties:encrypt>), master key "mulesoft" - a working example only, not a
+# real deployment. Encrypt your own filled-in secure.properties with your own master key; see README.
+ohip.clientId=![JUa0NpsnpiJQshF+WGY29laq+ov61W0J]
+ohip.clientSecret=![JUa0NpsnpiJQshF+WGY29rlWkWtXz/eHSzuCZ/KWTtg=]
+ohip.appKey=![3ZcRvAIYc84frN8bV/VcK0d5DMxu9qdM]
+ohip.enterpriseId=![+O4m7tcxig/julyIBKQjYxTey3zvK16w]
+anypoint.mq.clientId=![3ZcRvAIYc85jJHw1yQ12OMCThrJmd28YwBvpWTwW09U=]
+anypoint.mq.clientSecret=![3ZcRvAIYc85jJHw1yQ12OMCThrJmd28Y8Tsl/Kg3GlhLgaCq7aoTqQ==]

@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:websocket="http://www.mulesoft.org/schema/mule/websocket"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mule/websocket/current/mule-websocket.xsd">
+
+    <!--
+      ============================================================================================
+      HIGH AVAILABILITY (symmetric competing-consumer) CONTROLLER
+      ============================================================================================
+      This file is the ONLY behavioral addition over the base opera-stream-consumer producer. It
+      implements Oracle's "Implement a Connection Status Check" + "Recommended Competing Consumer
+      Pattern" as a SYMMETRIC competing consumer: every instance is
+      identical (no role). Run N of them against the same (Application Key, Chain) - as replicas of
+      one CloudHub 2.0 deployment (spread across AZs), and/or as separate deployments in other
+      regions. Each instance, while it does NOT hold the stream:
+
+        1. open the Stream socket and send connection_init  (connect-subflow, unchanged)
+        2. run `query { connection { id status } }`         (ha-send-status-query-subflow)
+        3. only send the EVENT subscribe when status==Inactive, after a jittered delay
+        4. whoever's subscribe lands first wins the Single-Consumer Lock; the losers get 4409 and
+           the base reconnect-flow backs off (2min+jitter) and re-probe.
+
+      The lock (4409) is enforced by OHIP on the SUBSCRIBE, not on the socket - so every instance
+      can hold a socket + poll status simultaneously without conflict, and OHIP itself is the
+      coordinator. That is what makes passive standbys possible and why no shared store or per-
+      instance identity is needed - the per-instance, non-persistent haStateOs is correct as-is.
+
+      Symmetric jitter: all instances use the SAME base delay + a random jitter, so a tie between
+      any number of instances resolves randomly without a 4409 storm. There is no privileged
+      instance; failover works the same whether the winner was a same-region replica or a
+      cross-region deployment.
+
+      Every flow here is gated on ohip.ha.enabled=='true'. With HA disabled the schedulers no-op and
+      the app behaves exactly like the base producer (ohip-startup-connect-flow drives it instead).
+    -->
+
+    <!--
+      Send Oracle's connection-status query over the live probe socket. The graphql-transport-ws
+      transport has no dedicated "query" frame, so a GraphQL query is sent as a `subscribe` op with a
+      fresh id; OHIP replies with a single `next` frame carrying payload.data.connection.{id,status},
+      routed by the connection-status branch in connect-flow.xml's intake router. Requires a live
+      current-socket-id (caller guarantees it).
+    -->
+    <sub-flow name="ha-send-status-query-subflow" doc:name="HA Send Status Query">
+        <os:retrieve key="'current-socket-id'" objectStore="currentSocketOs" target="haSocketId" doc:name="Retrieve current socket id" doc:description="Load the live probe socket" />
+        <websocket:send socketId="#[vars.haSocketId]" config-ref="ohip-stream-ws-config" doc:name="Send connection-status query" doc:description="Ask OHIP whether the stream is already held">
+            <websocket:content><![CDATA[#[output application/json --- {
+                id: uuid(),
+                'type': "subscribe",
+                payload: { query: "query { connection { id status } }" }
+            }]]]></websocket:content>
+        </websocket:send>
+    </sub-flow>
+
+    <!--
+      React to a connection-status response (called from the intake router with vars.connectionStatus).
+        Inactive -> the stream is free. If we haven't already scheduled a takeover, schedule one at
+                    now + role-base-delay + jitter. Whoever subscribes first wins; 4409 guards the loser.
+        Active   -> the peer holds the stream. Stand down: clear any scheduled takeover and stay passive,
+                    keep polling. This is how a recovered 'active' makes a 'standby' relinquish.
+    -->
+    <sub-flow name="ha-handle-status-subflow" doc:name="HA Handle Status">
+        <choice doc:name="Route on status" doc:description="Inactive = free to take over; Active = stand down">
+            <when expression="#[upper(vars.connectionStatus default '') == 'INACTIVE']" doc:description="Stream is free, so schedule a jittered takeover attempt">
+                <os:contains key="'ha-takeover-not-before'" objectStore="haStateOs" target="hasTakeover" doc:name="Takeover already scheduled?" doc:description="Avoid resetting an in-flight takeover timer" />
+                <choice doc:name="Schedule takeover if not already" doc:description="Only schedule once per Inactive streak">
+                    <when expression="#[not vars.hasTakeover]" doc:description="No takeover queued yet, so schedule one after the jittered delay">
+                        <!--
+                          Symmetric competing-consumer: every instance uses the SAME base delay plus a random
+                          jitter, so N identical instances (any replica count, any region) don't collide on the
+                          exact ms. Whoever's subscribe lands first wins the lock; the rest see Active and stand
+                          down. No per-instance role is needed - OHIP's 4409 lock is the coordinator.
+                        -->
+                        <set-variable variableName="takeoverDelayMs"
+                                      value="#[(p('ohip.ha.takeoverDelayMs') as Number) + (random() * (p('ohip.ha.takeoverJitterMaxMs') as Number))]"
+                                      doc:name="Compute jittered takeover delay" doc:description="Base delay plus random jitter, identical across instances" />
+                        <os:store key="'ha-takeover-not-before'" objectStore="haStateOs" doc:name="Schedule takeover" doc:description="Earliest time this instance may subscribe">
+                            <os:value><![CDATA[#[(now() as Number {unit: 'milliseconds'}) + vars.takeoverDelayMs]]]></os:value>
+                        </os:store>
+                        <logger level="INFO" doc:name="Log takeover scheduled" doc:description="Log that a takeover was scheduled"
+                                message="Status Inactive; scheduling takeover in ~#[round(vars.takeoverDelayMs)]ms." />
+                    </when>
+                    <otherwise>
+                        <logger level="DEBUG" doc:name="Takeover already pending" doc:description="A takeover is already scheduled" message="Status Inactive; takeover already scheduled, leaving timer as-is." />
+                    </otherwise>
+                </choice>
+            </when>
+            <otherwise>
+                <!-- Active: peer holds the stream. Stand down. -->
+                <os:contains key="'ha-takeover-not-before'" objectStore="haStateOs" target="hadTakeover" doc:name="Was a takeover scheduled?" doc:description="Clear it if the peer reclaimed" />
+                <choice doc:name="Cancel scheduled takeover if peer active" doc:description="Stand down when the peer holds the lock">
+                    <when expression="#[vars.hadTakeover]" doc:description="Peer holds the stream, so cancel our queued takeover and stay passive">
+                        <os:remove key="'ha-takeover-not-before'" objectStore="haStateOs" doc:name="Cancel takeover" doc:description="Peer is active; stand down" />
+                        <logger level="INFO" doc:name="Log stand down" doc:description="Log that this instance stood down" message="Status Active (peer holds stream); cancelling scheduled takeover and staying passive." />
+                    </when>
+                    <otherwise>
+                        <logger level="DEBUG" doc:name="Stay passive" doc:description="Remain passive" message="Status Active; staying passive." />
+                    </otherwise>
+                </choice>
+            </otherwise>
+        </choice>
+    </sub-flow>
+
+    <!--
+      The failover poller. Fires every ohip.ha.statusPollIntervalMs. Only meaningful while this instance
+      is PASSIVE (not holding the stream). It drives the probe socket, re-polls status, and executes a
+      due takeover. When this instance is active (ha-subscribed) it no-ops - the base keepalive/token
+      refresh/reconnect flows keep the live subscription healthy, and on-socket-closed clears ha-subscribed
+      to make this poller take over again.
+    -->
+    <flow name="ha-failover-controller-flow" maxConcurrency="1" doc:name="HA Failover Controller">
+        <scheduler doc:name="Poll" doc:description="Re-check status / drive takeover on the HA poll interval">
+            <scheduling-strategy>
+                <fixed-frequency frequency="${ohip.ha.statusPollIntervalMs}" startDelay="3000" />
+            </scheduling-strategy>
+        </scheduler>
+        <choice doc:name="Only in HA mode" doc:description="No-op unless ohip.ha.enabled=true">
+            <when expression="#[p('ohip.ha.enabled') == 'true']" doc:description="HA is enabled, so run the failover state machine">
+                <os:retrieve key="'ha-subscribed'" objectStore="haStateOs" target="haSubscribed" doc:name="Am I active (hold stream)?" doc:description="True if this instance holds the subscription">
+                    <os:default-value><![CDATA[#[false]]]></os:default-value>
+                </os:retrieve>
+                <choice doc:name="Act only while passive" doc:description="Do nothing while we hold the stream">
+                    <when expression="#[not vars.haSubscribed]" doc:description="We don't hold the stream, so probe, poll, or take over as needed">
+                        <os:contains key="'current-socket-id'" objectStore="currentSocketOs" target="hasSocket" doc:name="Has probe socket?" doc:description="Is a socket open to query on" />
+                        <os:contains key="'connect-in-progress'" objectStore="currentSocketOs" target="connecting" doc:name="Connect in progress?" doc:description="A connect attempt is already running" />
+                        <os:contains key="'reconnect-pending'" objectStore="reconnectStateOs" target="hasPending" doc:name="Reconnect pending?" doc:description="A backoff reconnect is queued (e.g. after 4409)" />
+                        <os:contains key="'ha-takeover-not-before'" objectStore="haStateOs" target="hasTakeover" doc:name="Takeover scheduled?" doc:description="Are we waiting to subscribe" />
+                        <choice doc:name="Passive state machine" doc:description="Probe -> poll -> take over">
+                            <!--
+                              (a) Takeover is scheduled AND due AND we still hold a socket -> attempt the event
+                              subscribe. If we win, a Business Event arrives and marks ha-subscribed. If we lose
+                              the race, OHIP closes 4409 and the base reconnect-flow backs off + re-probes.
+                            -->
+                            <when expression="#[vars.hasTakeover and vars.hasSocket]" doc:description="Takeover is scheduled and we have a socket, so subscribe once it's due">
+                                <os:retrieve key="'ha-takeover-not-before'" objectStore="haStateOs" target="notBefore" doc:name="Load takeover not-before" doc:description="Earliest allowed subscribe time" />
+                                <choice doc:name="If takeover due" doc:description="Wait out the role-biased delay">
+                                    <when expression="#[(now() as Number {unit: 'milliseconds'}) &gt;= (vars.notBefore as Number)]" doc:description="Takeover delay has elapsed, so send the event subscribe now">
+                                        <os:remove key="'ha-takeover-not-before'" objectStore="haStateOs" doc:name="Consume takeover schedule" doc:description="Clear so we don't re-fire" />
+                                        <os:retrieve key="'current-socket-id'" objectStore="currentSocketOs" target="socketId" doc:name="Retrieve socket id" doc:description="Socket to subscribe on" />
+                                        <logger level="INFO" doc:name="Log taking over" doc:description="Attempting to acquire the stream"
+                                                message="Takeover due; sending event subscribe to acquire the stream (other instances, if any, win/lose the 4409 race)." />
+                                        <flow-ref name="send-event-subscribe-subflow" doc:name="Send Event Subscribe" doc:description="Attempt to acquire the Single-Consumer Lock" />
+                                    </when>
+                                    <otherwise>
+                                        <logger level="DEBUG" doc:name="Takeover not yet due" doc:description="Still within the delay window" message="Takeover scheduled but not yet due; waiting." />
+                                    </otherwise>
+                                </choice>
+                            </when>
+                            <!--
+                              (b) No socket and nothing else is connecting/backing off -> open a probe socket.
+                              connect-subflow opens it and sends connection_init; the ack handler then fires the
+                              first connection-status query automatically.
+                            -->
+                            <when expression="#[not vars.hasSocket and not vars.connecting and not vars.hasPending]" doc:description="No socket and nothing else connecting, so open a probe socket">
+                                <logger level="INFO" doc:name="Log opening probe" doc:description="Opening a probe socket to check status" message="Passive and no socket; opening probe socket to check connection status." />
+                                <flow-ref name="connect-subflow" doc:name="connect-subflow" doc:description="Open socket + connection_init (ack triggers first status query)" />
+                            </when>
+                            <!--
+                              (c) We hold a socket and no takeover is scheduled -> re-poll status. Each poll uses a
+                              fresh query id and OHIP's status reply is idempotent, so an occasional overlapping query
+                              (if one reply is slow) is harmless - no in-flight tracking needed.
+                            -->
+                            <when expression="#[vars.hasSocket]" doc:description="We have a socket and no takeover queued, so re-poll connection status">
+                                <logger level="DEBUG" doc:name="Log re-poll" doc:description="Routine re-poll" message="Passive with socket; re-polling connection status." />
+                                <flow-ref name="ha-send-status-query-subflow" doc:name="HA Send Status Query" doc:description="Re-check connection status" />
+                            </when>
+                        </choice>
+                    </when>
+                    <otherwise>
+                        <logger level="DEBUG" doc:name="Active - poller idle" doc:description="We hold the stream; nothing to do" message="This instance holds the stream (active); failover poller idle." />
+                    </otherwise>
+                </choice>
+            </when>
+        </choice>
+    </flow>
+
+</mule>
