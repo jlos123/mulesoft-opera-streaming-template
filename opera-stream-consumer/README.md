@@ -3,7 +3,7 @@
 A reference-quality Mule 4 application that consumes Oracle OHIP (Opera Cloud) **Business Events**
 from the OHIP **Streaming API** over a `graphql-transport-ws` WebSocket, following Oracle's
 documented best practices. Intended for internal and external Mule developers integrating with
-Opera Cloud. See [`CONTEXT.md`](../CONTEXT.md) for the domain glossary.
+Opera Cloud.
 
 ## Architecture
 

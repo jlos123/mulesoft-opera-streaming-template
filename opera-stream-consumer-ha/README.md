@@ -81,10 +81,11 @@ instance, while it does **not** hold the stream:
 **Symmetric jitter:** every instance uses the same `ohip.ha.takeoverDelayMs` (default 1s) plus a random
 `0..takeoverJitterMaxMs`, so a tie between any number of instances resolves randomly without a `4409`
 storm. No instance is privileged. When the holder dies, the first surviving instance to observe
-`Inactive` on its poll takes over within `takeoverDelayMs + jitter`. Under **Orchestration** (the design notes)
-the consumer always re-fetches current state, so which instance/region holds the lock is not a
-correctness concern — there is no reason to prefer a specific one. (See the design notes;
-this supersedes the `active`/`standby` role bias in the design notes.)
+`Inactive` on its poll takes over within `takeoverDelayMs + jitter`. Under **Orchestration** the
+consumer always re-fetches current state, so which instance/region holds the lock is not a
+correctness concern — there is no reason to prefer a specific one. This is a symmetric design:
+an earlier `active`/`standby` role-biased topology was superseded by this simpler, fully
+interchangeable-instance approach.
 
 ## Configuration
 
