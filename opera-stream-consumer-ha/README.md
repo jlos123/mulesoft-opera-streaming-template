@@ -1,16 +1,16 @@
 # Opera Stream Consumer — HA variant (symmetric competing consumer)
 
-> **Set Up Steps are exactly the same as other README.** See
+> **Setup is the same as the base app.** See
 > [`opera-stream-consumer`](../opera-stream-consumer/README.md) for the Quickstart, Configuration
 > (baseline + tunables), Secure Properties setup, local simulator instructions, and the developer's
 > plug-in point. This README covers only what's **net new** in the HA variant.
 
 This app is the base `opera-stream-consumer` plus one behavioral addition —
 [`src/main/mule/ha-failover-flow.xml`](src/main/mule/ha-failover-flow.xml) — implementing Oracle's
-**connection-status-check + jittered-failover** pattern (Streaming API Oracle's Streaming API Guide), toggled by
+**connection-status-check + jittered-failover** pattern from Oracle's Streaming API Guide, toggled by
 `ohip.ha.enabled`. With `ohip.ha.enabled=false` it behaves **exactly** like the base app for stream
 consumption — it just carries one extra gated poller (the `ha-failover-controller-flow` scheduler),
-which still fires on its interval but no-ops while HA is off
+which still fires on its interval but no-ops while HA is off.
 
 ## Architecture
 
@@ -57,13 +57,15 @@ flowchart TB
 OHIP Streaming API enforces a **Single-Consumer Lock**: only one active **event subscription** per (Application Key,
 Chain) is allowed; a second one is rejected with close code `4409`.
 
-To avoid downtime in case of a stream consumer fails - like if an AWS availability zone or region goes out - this app can be deployed across multiple replica's in region or across region.
+To avoid downtime from a stream consumer failure, such as an AWS availability zone or region outage, this app can be deployed across multiple replicas in one region or across regions.
 
-For the Cloudhub 2.0 deployment model:
-- To achieve in-region high availability, select 2 replica's at deployment. This automatically distributes the app across multiple availability zones in AWS
-- To achieve cross-region high-availability deploy this app in 2 different Cloudhub 2.0 regions, and when you create your Anypoint MQ queues in the admin console, ensure "Cross-Region Failover" is enabled
+## Deployment topologies
 
-**Note: scaling the stream consumer app to multiple replica's does not improve performance, only one replica will ever be connected to the OHIP streaming API at any given time.**
+For the CloudHub 2.0 deployment model:
+- To achieve in-region high availability, select 2 replicas at deployment. This automatically distributes the app across multiple availability zones in AWS.
+- To achieve cross-region high availability, deploy this app in 2 different CloudHub 2.0 regions. When you create your Anypoint MQ queues in the admin console, ensure "Cross-Region Failover" is enabled.
+
+**Note: scaling the stream consumer app to multiple replicas does not improve performance. Only one replica will ever be connected to the OHIP Streaming API at any given time.**
 
 ## How it works
 

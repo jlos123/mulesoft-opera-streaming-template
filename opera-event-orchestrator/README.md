@@ -96,7 +96,7 @@ and in-flight messages are nacked for `tripTimeout`, then a half-open trial fetc
 
 | Property | Default | Meaning |
 |---|---|---|
-| `ohip.mq.cb.onErrorTypes` | `HTTP:CONNECTIVITY,HTTP:TIMEOUT,HTTP:SERVICE_UNAVAILABLE,HTTP:BAD_GATEWAY,HTTP:GATEWAY_TIMEOUT` | HTTP errors that mean "OHIP unreachable / down". Drives **both** the breaker and the flow's `on-error-propagate` `type`, so the list is defined once. Excludes `HTTP:NOT_FOUND` (404-as-delete success) and `HTTP:TOO_MANY_REQUESTS` (429 → handled by [Rate-limit re-drive](#rate-limit-429-delayed-re-drive), not the breaker). |
+| `ohip.mq.cb.onErrorTypes` | `HTTP:CONNECTIVITY,HTTP:TIMEOUT,HTTP:SERVICE_UNAVAILABLE,HTTP:BAD_GATEWAY,HTTP:GATEWAY_TIMEOUT` | HTTP errors that mean "OHIP unreachable / down". Drives **both** the breaker and the flow's `on-error-propagate` `type`, so the list is defined once. Excludes `HTTP:NOT_FOUND` (404-as-delete success) and `HTTP:TOO_MANY_REQUESTS` (429, not the breaker). |
 | `ohip.mq.cb.errorsThreshold` | `5` | Failures counted before OPENing. **Keep low relative to the queue's max-delivery-count** (e.g. `max_deliveries=10`) so the breaker trips *before* an outage burns redeliveries and DLQs good events. Counting is **strictly consecutive**: *any* success — a clean event, a 404-as-delete, a poison nack, or an error type not in `onErrorTypes` — resets the counter to 0. So only a *full* outage (every re-fetch failing) climbs to the threshold; a flaky/partial OHIP keeps resetting and won't trip (by design — that's poison/429 territory). |
 | `ohip.mq.cb.tripTimeout` | `30` | How long the breaker stays OPEN (polling halted) before a half-open trial. **Hard floor of 1000 ms** — the connector throws at startup if `tripTimeout` resolves below one second. |
 | `ohip.mq.cb.tripTimeoutUnit` | `SECONDS` | Time unit for `tripTimeout`. |
@@ -126,7 +126,7 @@ Current defaults target **moderate volume**. Knobs, in the order you'd reach for
 | Knob | Where | Effect |
 |---|---|---|
 | `ohip.mq.consumerConcurrency` | `config.properties` | Events processed in parallel. Raise this toward whichever binds first: backend write capacity **or OHIP REST rate limits**. |
-| Poll `frequency` | `opera-event-orchestrator.xml` | How often to fetch from MQ.
+| Poll `frequency` | `opera-event-orchestrator.xml` | How often to fetch from MQ. |
 | Horizontal scale (workers) | Runtime Manager | Add CloudHub workers on the same standard queue; the broker load-balances across them.
 
 **Follow-ups to know:**

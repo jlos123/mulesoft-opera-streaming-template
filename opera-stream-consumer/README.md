@@ -50,7 +50,7 @@ flowchart TB
 
 Get a sandbox chain streaming events onto Anypoint MQ in about 15 minutes.
 
-**If you just want to run the Mule app against a local simulator, just do step 2, and 5**
+**If you just want to run the Mule app against the local simulator, do steps 2 and 5.**
 
 1. **Retrieve the required details from the Oracle OHIP Developer Portal.** Register a
    **MuleSoft-dedicated** application against your UAT/sandbox tenant and pull everything listed in
@@ -58,7 +58,7 @@ Get a sandbox chain streaming events onto Anypoint MQ in about 15 minutes.
    Application Key, etc.) — see Oracle's
    [Streaming API Guide](https://docs.oracle.com/en/industries/hospitality/integration-platform/stmig/)
    for exactly how to obtain each value from the portal. **Give MuleSoft its own Application Key and
-   an template of events scoped to only the events it needs** — this is the single biggest lever on both
+   a Template of Events scoped to only the events it needs** — this is the single biggest lever on both
    correctness and message consumption; see
    [Set up a dedicated OHIP Application Key for MuleSoft](#set-up-a-dedicated-ohip-application-key-for-mulesoft).
    Confirm your environment owner has **approved the event subscription** — events won't flow without
@@ -69,25 +69,31 @@ Get a sandbox chain streaming events onto Anypoint MQ in about 15 minutes.
    lets you fan out to additional consumers later by binding more queues — no publisher change.
 3. **Fill in the config.** Edit `src/main/resources/config.properties` with your host, port,
    and `ohip.chainCode`. Copy `secure.properties.sample` → `secure.properties` and fill in the
-   real secrets from step 1 and 2
+   real secrets from steps 1 and 2.
 4. **Encrypt the secrets** with the MuleSoft Secure Properties Tool using a master key of your
    choosing (see [Setting up Secure Properties](#setting-up-secure-properties) below).
-5. **Optional Build and deploy locally against simulated service:**
+5. **Optional: build and deploy locally against the simulator.**
    No live Oracle tenant yet? See
-[Running against the local simulator](#running-against-the-local-simulator) below — `sim/ohip-sim.js`
-is a local stand-in for OHIP that lets you exercise the whole flow end-to-end before touching a
-real sandbox, with `config.properties` already pointed at it out of the box.
-   Test the apps in Anypoint Studio or Code Builder against the sim, ensure you set the [environment properties](https://docs.mulesoft.com/cloudhub-2/ch2-manage-props#example-using-properties-to-set-environment-variables) `mule.key=mulesoft (or replace with your new secure key)` To pass it via a launch configuration locally, see
+   [Running against the local simulator](#running-against-the-local-simulator) below — `sim/ohip-sim.js`
+   is a local stand-in for OHIP that lets you exercise the whole flow end-to-end before touching a
+   real sandbox, with `config.properties` already pointed at it out of the box.
+   Test the apps in Anypoint Studio or Code Builder against the sim, and set the
+   [environment property](https://docs.mulesoft.com/cloudhub-2/ch2-manage-props#example-using-properties-to-set-environment-variables)
+   `mule.key=mulesoft` (or replace it with your own secure key). To pass it via a launch configuration locally, see
    [Anypoint Code Builder](https://docs.mulesoft.com/anypoint-code-builder/int-run-mule-apps-with-properties#use-environment-variables-in-launch-configurations)
    or [Anypoint Studio](https://docs.mulesoft.com/mule-runtime/latest/configuring-properties#setting-environment-variables-in-anypoint-studio).
-6. **Deploy `opera-stream-consumer` to single replica [details on why single replica here](#competing-consumer-ha-pattern) and verify the handshake.** Confirm the logs show: OAuth token obtained → WebSocket opened →
+6. **Deploy `opera-stream-consumer` to a single replica and verify the handshake.** See
+   [Competing-consumer HA pattern](#competing-consumer-ha-pattern) for why this app should run as one replica.
+   Confirm the logs show: OAuth token obtained → WebSocket opened →
    `connection_ack` received → `subscribe` sent. Then, in the sandbox, create or update a record
    (e.g. a profile) and confirm a `next` frame with a populated `eventName`/`primaryKey` shows up
    in the logs and lands on the Anypoint MQ exchange (and, via the binding, its queue).
-7. **Deploy the companion `opera-event-orchestrator` app** Deploy the companion
-   `opera-event-orchestrator` app against `ohip.mq.consumerDestination` (the queue bound
+7. **Deploy the companion `opera-event-orchestrator` app.** Point it at `ohip.mq.consumerDestination` (the queue bound
    to the exchange in step 2), and replace its stub Logger with your real backend integration (see
-   [The developer's plug-in point](#the-developers-plug-in-point)), ensure you deploy with the [environment properties](https://docs.mulesoft.com/cloudhub-2/ch2-manage-props#example-using-properties-to-set-environment-variables) `mule.key=mulesoft (or replace with your new secure key) anypoint.mq.subscriber.backpressure.enabled=true` to the **opera-event-orchestrator** app
+   [The developer's plug-in point](#the-developers-plug-in-point)). Deploy the
+   **opera-event-orchestrator** app with the
+   [environment properties](https://docs.mulesoft.com/cloudhub-2/ch2-manage-props#example-using-properties-to-set-environment-variables)
+   `mule.key=mulesoft` (or your own secure key) and `anypoint.mq.subscriber.backpressure.enabled=true`.
 
 
 ## Set up a dedicated OHIP Application Key for MuleSoft
@@ -126,10 +132,10 @@ real sandbox, with `config.properties` already pointed at it out of the box.
 Everything below is a value you must retrieve from the Oracle OHIP Developer Portal or the
 Anypoint MQ admin console. The non-secret ones ship with sim/placeholder defaults in
 `config.properties` (pointed at the local simulator) that you **must replace for a real tenant** —
-including `anypoint.mq.url` Non-secret values go in
-`src/main/resources/config.properties`; secrets go in `secure.properties` See
+including `anypoint.mq.url`. Non-secret values go in
+`src/main/resources/config.properties`. Secrets go in `secure.properties`. See
 `secure.properties.sample` for the dummy-value template, and `secure.properties.encrypted.sample`
-for a working encrypted example
+for a working encrypted example.
 
 | Property | Description | Where to get it |
 |---|---|---|
@@ -158,6 +164,7 @@ have a reason to (e.g. a stricter SLA, or Oracle changes a documented timing).
 | `ohip.reconnect.wait4504Ms` | Service timeout (4504) reconnect wait | 15s |
 | `ohip.reconnect.waitDefaultMs` | Reconnect wait for routine closes (e.g. `1000`/`1001`) | 0ms (immediate) |
 | `ohip.reconnect.wait1006Ms` | Abnormal closure (1006) reconnect wait | 4s |
+| `ohip.reconnect.schedulerPollMs` | How often the reconnect scheduler checks for a due reconnect | 15s |
 | `ohip.tokenRefresh.leadTimeMs` | How long before expiry to proactively refresh the token | 2 min |
 | `ohip.tokenRefresh.completeToSubscribeGapMs` | Minimum gap between `complete` and the next `subscribe` | 10s (Oracle's documented minimum — don't go lower) |
 | `ohip.tokenRefresh.checkIntervalMs` | How often the proactive token-refresh scheduler checks token expiry | 30s |
@@ -201,7 +208,7 @@ replicas would trigger this immediately — so keep it at one replica.
 If in-region or cross-region **High Availability** is required, use the sibling app
 **[`opera-stream-consumer-ha`](../opera-stream-consumer-ha/)** 
 
-# Running locally against OHIP Sim in Studio or ACB
+## Running locally against OHIP Sim in Studio or ACB
 
 `sim/ohip-sim.js` is a self-contained Node stand-in for OHIP — no Oracle sandbox or Anypoint MQ
 required for a first pass, since it implements the OAuth token endpoint and the
@@ -235,7 +242,7 @@ interval — by default every 10–20 seconds (tune with `EVENT_INTERVAL_MIN_MS`
 — so the Stream doesn't sit silent, without flooding your logs.
 
 
-Run the applications the Secure Properties master key: `-Dmule.key=<your-master-key>`. To pass it via a launch
+Run the applications with the Secure Properties master key: `-Dmule.key=<your-master-key>`. To pass it via a launch
 configuration instead, see
 [Anypoint Code Builder](https://docs.mulesoft.com/anypoint-code-builder/int-run-mule-apps-with-properties#use-environment-variables-in-launch-configurations)
 or [Anypoint Studio](https://docs.mulesoft.com/mule-runtime/latest/configuring-properties#setting-environment-variables-in-anypoint-studio).
@@ -256,4 +263,3 @@ or [Anypoint Studio](https://docs.mulesoft.com/mule-runtime/latest/configuring-p
 | Change the port | `PORT=8081 node ohip-sim.js` |
 
 See the header comment in `sim/ohip-sim.js` for the full list of env vars.
-

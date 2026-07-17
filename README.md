@@ -4,9 +4,9 @@ A two-app MuleSoft reference solution for consuming Oracle OHIP (Opera Cloud) **
 from the OHIP **Streaming API** and processing them reliably:
 
 1. **[`opera-stream-consumer/`](opera-stream-consumer/)** — a Mule 4 app that creates a GraphQL subscription over WebSockets to OHIP, and handles the full connection lifecycle (auth, keepalive,
-   token refresh, close-code-aware reconnect), and publishes each Business Event to a durable AnypointMQ Message Exchange.
+   token refresh, close-code-aware reconnect), and publishes each Business Event to a durable Anypoint MQ Message Exchange.
 2. **[`opera-event-orchestrator/`](opera-event-orchestrator/)** — a
-   companion Mule 4 app that drains that queue and, following Oracle's **Orchestration** pattern, treats each event as a trigger, re-fetching the changed resource's current state from the OHIP REST API and upserts it. It is the plug-in point for your own backend integration.
+   companion Mule 4 app that drains that queue and, following Oracle's **Orchestration** pattern, treats each event as a trigger, re-fetching the changed resource's current state from the OHIP REST API and upserting it. It is the plug-in point for your own backend integration.
 
 Plus an **optional HA variant** of app 1:
 
@@ -30,7 +30,7 @@ live Oracle tenant.
 ## Layout
 
 ```
-opera-streaming-solution/
+mulesoft-opera-streaming-template/
 ├── solution.code-workspace              open THIS in VS Code
 ├── opera-stream-consumer/                 app 1 — WebSocket consumer
 ├── opera-stream-consumer-ha/              app 1 + symmetric competing-consumer HA
@@ -46,19 +46,19 @@ opera-streaming-solution/
 
 ## Architecture Overview
 
-Three moving pieces, in sequence: a **WebSocket consumer app** (this template) turns Oracle's
+Three moving pieces, in sequence: a **WebSocket consumer app** turns Oracle's
 push-based Stream into durable messages published to an **Anypoint MQ exchange** (fanned out to a
 bound standard queue); an **event queue** decouples that fast intake from a possibly-slow backend;
 and an **orchestration consumer** (the companion
 `opera-event-orchestrator` app) drains the queue and is where you plug
-in real backend logic the consumer re-fetches current resource state
-per event
+in real backend logic. The consumer re-fetches current resource state
+per event.
 
-This template uses **Anypoint MQ** for the queue as it's a quick, production grade messaging solution for exactly these types of processing patterns but Oracle's own guidance treats the queue as a swappable buffer, not a specific
+This template uses **Anypoint MQ** for the queue because it is a quick, production-grade messaging solution for exactly these processing patterns, but Oracle's own guidance treats the queue as a swappable buffer, not a specific
 product — the docs explicitly call out **Apache Kafka**, **RabbitMQ**, and **Amazon SQS** as
-equally valid choices (see the design-decision table below). Swapping in a different broker only
+equally valid choices. Swapping in a different broker only
 touches the `anypoint-mq:publish`/`anypoint-mq:subscriber` operations in `connect-flow.xml` and
-the consumer app — the rest of the WebSocket handling is unaffected.
+`opera-event-orchestrator.xml` — the rest of the WebSocket handling is unaffected.
 
 ```mermaid
 flowchart TB
@@ -133,7 +133,7 @@ flowchart TB
 
 | App | Flows | The message source in each |
 |---|---:|---|
-| `opera-stream-consumer` | **6** | `scheduler` connect-check (30s) · `scheduler` keepalive ping (15s) · `scheduler` reconnect-check (5s) · `scheduler` token-refresh-check (30s) · `websocket:outbound-listener` stream intake · `websocket:on-socket-closed` |
+| `opera-stream-consumer` | **6** | `scheduler` connect-check (30s) · `scheduler` keepalive ping (15s) · `scheduler` reconnect-check (15s default) · `scheduler` token-refresh-check (30s) · `websocket:outbound-listener` stream intake · `websocket:on-socket-closed` |
 | `opera-stream-consumer-ha` | **7** | the 6 above **+** `scheduler` HA status-poll (15s) — the extra flow in `ha-failover-flow.xml` |
 | `opera-event-orchestrator` | **1** | `anypoint-mq:subscriber` |
 | **Total (base pair)** | **7** | `opera-stream-consumer` + `opera-event-orchestrator` |
@@ -148,7 +148,7 @@ instance:
 messages(T) ≈ scheduler_fires + websocket_frames + socket_closes + mq_events
 
 where, for the streaming app (per instance):
-  scheduler_fires   = T/30 (connect) + T/15 (ping) + T/5 (reconnect) + T/30 (token)   [+ T/15 HA poll]
+  scheduler_fires   = T/30 (connect) + T/15 (ping) + T/15 (reconnect) + T/30 (token)   [+ T/15 HA poll]
   websocket_frames  = business_events_delivered + protocol_frames(connection_ack, ping/pong, complete)
   socket_closes     = number of disconnects in T   (one message per close)
 
@@ -160,17 +160,18 @@ for the orchestrator (per instance):
 **Idle baseline (streaming app, no events, no disconnects), messages/hour per instance:**
 
 ```
-single replica opera stream consumer configuration: 3600/30 + 3600/15 + 3600/5 + 3600/30  = 120 + 240 + 720 + 120        = 1,200 /hr
-HA opera stream consumer configuration  : 1,200 + 3600/15 (status poll)          = 1,200 + 240                  = 1,440 /hr
+single replica opera stream consumer configuration: 3600/30 + 3600/15 + 3600/15 + 3600/30  = 120 + 240 + 240 + 120 = 720 /hr
+HA opera stream consumer configuration  : 720 + 3600/15 (status poll)                    = 720 + 240             = 960 /hr
 ```
 
 Add `websocket_frames` (roughly one intake message per Business Event, plus keepalive/ack protocol
 frames) and one message per reconnect on top of that baseline. The orchestrator adds ~one message per
 Business Event it dequeues. **Multiply by instance count** — the HA variant runs **N** identical
-instances (your replica count summed across regions), so its scheduler baseline is `N × 1,440 /hr`
-(e.g. 2 instances → `2,880 /hr`) while only one instance holds the subscription and receives event
+instances (your replica count summed across regions), so its scheduler baseline is `N × 960 /hr`
+(e.g. 2 instances → `1,920 /hr`) while only one instance holds the subscription and receives event
 frames at a time.
 
 > The scheduler frequencies above are the shipped defaults (`ohip.tokenRefresh.checkIntervalMs=30000`,
-> `ohip.ha.statusPollIntervalMs=15000`, and the hard-coded 30s/15s/5s schedulers). Raising any interval
+> `ohip.reconnect.schedulerPollMs=15000`, `ohip.ha.statusPollIntervalMs=15000`, and the hard-coded
+> 30s/15s schedulers). Raising any interval
 > lowers the idle message count.

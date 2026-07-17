@@ -1,6 +1,5 @@
-# Root .gitignore — serves the private monorepo AND is copied to the public repo by publish.sh.
+# Root .gitignore.
 # Only NEVER-TRACK things live here (real secrets, build output, OS/IDE cruft).
-# What stays PRIVATE vs. what goes PUBLIC is decided by the allowlist in publish.sh, not here.
 
 # --- Build output ---
 **/target/
