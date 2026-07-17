@@ -1,23 +1,32 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<!--
-  App-level logging. Console-only: routes this app's loggers to stdout so they appear in the IDE/terminal
-  locally and are captured by CloudHub's log stream in the cloud (stdout is the source of truth there).
-  No file appender - on CloudHub a RollingFile just duplicates the console stream to disk nobody reads.
--->
+<?xml version="1.0" encoding="utf-8"?>
 <Configuration>
+
+    <!--These are some of the loggers you can enable.
+        There are several more you can find in the documentation.
+        Besides this log4j configuration, you can also use Java VM environment variables
+        to enable other logs like network (-Djavax.net.debug=ssl or all) and
+        Garbage Collector (-XX:+PrintGC). These are appended to the console (stdout). -->
+
     <Appenders>
+        <!-- Console-only: on CloudHub stdout is the captured log stream (source of truth); a RollingFile
+             would just duplicate it to local disk nobody reads. Console also shows in the IDE/terminal locally. -->
         <Console name="Console" target="SYSTEM_OUT">
-            <PatternLayout pattern="%d{HH:mm:ss.SSS} %-5p [%c{1}] %m%n"/>
+            <PatternLayout pattern="%-5p %d [%t] [processor: %X{processorPath}; event: %X{correlationId}] %c: %m%n"/>
         </Console>
     </Appenders>
+
     <Loggers>
-        <!-- This app's flows and DataWeave loggers. -->
-        <AsyncLogger name="com.datafoundations.opera" level="INFO"/>
-        <!-- Quieten noisy connector/runtime chatter; raise to DEBUG when troubleshooting. -->
+        <!-- Http Logger shows wire traffic on DEBUG -->
+        <!--AsyncLogger name="org.mule.service.http.impl.service.HttpMessageLogger" level="DEBUG"/-->
         <AsyncLogger name="org.mule.service.http" level="WARN"/>
-        <AsyncLogger name="com.mulesoft.mule.runtime" level="WARN"/>
-        <Root level="INFO">
+        <AsyncLogger name="org.mule.extension.http" level="WARN"/>
+
+        <!-- Mule logger -->
+        <AsyncLogger name="org.mule.runtime.core.internal.processor.LoggerMessageProcessor" level="INFO"/>
+
+        <AsyncRoot level="INFO">
             <AppenderRef ref="Console"/>
-        </Root>
+        </AsyncRoot>
     </Loggers>
+
 </Configuration>

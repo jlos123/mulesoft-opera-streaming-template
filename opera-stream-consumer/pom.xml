@@ -2,10 +2,10 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <groupId>com.datafoundations.opera</groupId>
-    <artifactId>opera-stream-consumer-template</artifactId>
+    <artifactId>opera-stream-consumer</artifactId>
     <version>1.0.0</version>
     <packaging>mule-application</packaging>
-    <name>opera-stream-consumer-template</name>
+    <name>opera-stream-consumer</name>
     <description>Reference-quality Mule 4 app consuming Oracle OHIP (Opera Cloud) Business Events over the Streaming API.</description>
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -74,9 +74,9 @@
     </dependencies>
     <repositories>
         <repository>
-            <id>anypoint-exchange-v2</id>
+            <id>anypoint-exchange-v3</id>
             <name>Anypoint Exchange</name>
-            <url>https://maven.anypoint.mulesoft.com/api/v2/maven</url>
+            <url>https://maven.anypoint.mulesoft.com/api/v3/maven</url>
             <layout>default</layout>
         </repository>
         <repository>
