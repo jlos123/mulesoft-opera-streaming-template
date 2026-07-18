@@ -11,7 +11,7 @@ http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/cu
 http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mule/websocket/current/mule-websocket.xsd">
 
     <flow name="ohip-on-socket-closed-flow" maxConcurrency="1" doc:name="OHIP On Socket Closed">
-        <websocket:on-socket-closed path="/subscriptions" config-ref="ohip-stream-ws-config" doc:name="On Socket Closed" doc:description="Trigger when Opera closes the connection" />
+        <websocket:on-socket-closed path="/subscriptions" config-ref="ohip-stream-ws-config" doc:id="socket-closed-listener" doc:name="On Socket Closed" doc:description="Trigger when Opera closes the connection" />
         <java:invoke doc:name="Read numeric close code"
                      instance="#[payload.code]"
                      class="org.mule.runtime.http.api.ws.WebSocketCloseCode"
@@ -28,7 +28,7 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
         <os:contains key="'offset-record'" objectStore="offsetStateOs" target="hasOffsetRecord" doc:name="Has stored Offset record?" doc:description="Check for a saved Offset" />
         <choice doc:name="Update lastConnectedAt if record exists" doc:description="Record when the connection last dropped">
             <when expression="#[vars.hasOffsetRecord]" doc:description="A saved Offset exists, so stamp it with the disconnect time">
-                <os:retrieve key="'offset-record'" objectStore="offsetStateOs" target="offsetRecord" doc:name="Retrieve Offset record" doc:description="Load the saved Offset" />
+                <os:retrieve key="'offset-record'" objectStore="offsetStateOs" target="offsetRecord" doc:id="offset-record-retrieve-reconnect" doc:name="Retrieve Offset record" doc:description="Load the saved Offset" />
                 <os:store key="'offset-record'" objectStore="offsetStateOs" doc:name="Update lastConnectedAt only" doc:description="Timestamp the disconnect">
                     <os:value><![CDATA[#[vars.offsetRecord ++ {lastConnectedAt: now() as String}]]]></os:value>
                 </os:store>

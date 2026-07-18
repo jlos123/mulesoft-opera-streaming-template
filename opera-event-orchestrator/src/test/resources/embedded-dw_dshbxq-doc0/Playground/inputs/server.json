@@ -1,0 +1,22 @@
+{
+  "env": {
+    "entry": "convallis"
+  },
+  "fileSeparator": "arcu",
+  "host": "Lorem",
+  "ip": "viverra",
+  "locale": "lorem",
+  "javaVendor": "risus",
+  "javaVersion": "ac",
+  "osArch": "aliquam",
+  "osName": "An",
+  "osVersion": "nunc",
+  "systemProperties": {
+    "entry": "a"
+  },
+  "timeZone": "molestie",
+  "tmpDir": "molestie",
+  "userDir": "justo",
+  "userHome": "libero",
+  "userName": "Adelle"
+}

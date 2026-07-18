@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["access_token"],
+  "properties": {
+    "access_token": { "type": "string" },
+    "expires_in": { "type": "integer" },
+    "token_type": { "type": "string" },
+    "oracle_tk_context": { "type": "string" }
+  }
+}

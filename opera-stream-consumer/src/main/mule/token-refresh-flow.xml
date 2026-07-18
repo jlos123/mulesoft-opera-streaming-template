@@ -16,7 +16,7 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
       handles the expected case.
     -->
     <flow name="proactive-token-refresh-scheduler-flow" maxConcurrency="1" doc:name="Proactive Token Refresh Scheduler">
-        <scheduler doc:name="Every 30s" doc:description="Check every 30 seconds if the token is about to expire">
+        <scheduler doc:name="Trigger every ohip.tokenRefresh.checkIntervalMs" doc:description="Check  if the token is about to expire">
             <scheduling-strategy>
                 <fixed-frequency frequency="${ohip.tokenRefresh.checkIntervalMs}" />
             </scheduling-strategy>

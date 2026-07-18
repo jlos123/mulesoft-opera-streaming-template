@@ -1,0 +1,29 @@
+{
+  "description": "Lorem ipsum dolor sit amet consectetur adipiscing elit. Fusce at arcu lectus. Nam lorem nibh pretium a nisi a viverra consectetur dui. In ac tincidunt libero. Pellentesque pulvinar justo vitae molestie tempor nunc risus faucibus ipsum semper tempor erat erat sed",
+  "detailedDescription": "Nunc",
+  "failingComponent": "Lorem",
+  "errorType": {
+    "identifier": "semper",
+    "namespace": "Altha"
+  },
+  "cause": {
+    "message": "elit",
+    "class": "justo"
+  },
+  "errorMessage": {},
+  "childErrors": [
+    {
+      "description": "Lorem ipsum dolor sit amet consectetur adipiscing elit. Fusce at arcu lectus. Nam lorem nibh pretium a nisi a viverra consectetur dui. In ac tincidunt libero. Pellentesque pulvinar justo vitae molestie tempor nunc risus faucibus ipsum semper tempor erat erat",
+      "detailedDescription": "erat",
+      "failingComponent": "lorem",
+      "errorType": {
+        "identifier": "molestie",
+        "namespace": "Chad"
+      },
+      "cause": {
+        "message": "dolor",
+        "class": "arcu"
+      }
+    }
+  ]
+}

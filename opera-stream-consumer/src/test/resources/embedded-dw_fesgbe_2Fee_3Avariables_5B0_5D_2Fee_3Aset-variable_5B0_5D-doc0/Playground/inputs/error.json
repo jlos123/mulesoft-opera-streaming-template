@@ -1,0 +1,29 @@
+{
+  "description": "Lorem ipsum dolor sit amet consectetur adipiscing elit. Fusce at arcu lectus. Nam lorem nibh pretium a nisi a viverra consectetur dui. In ac tincidunt libero. Pellentesque pulvinar justo vitae molestie tempor nunc risus faucibus ipsum semper tempor erat erat sed mi. Aliquam convallis nunc felis molestie sodales dolor sodales ut. Nunc aliquam eros",
+  "detailedDescription": "mi",
+  "failingComponent": "Nunc",
+  "errorType": {
+    "identifier": "tincidunt",
+    "namespace": "Christopher"
+  },
+  "cause": {
+    "message": "Nunc",
+    "class": "Fusce"
+  },
+  "errorMessage": {},
+  "childErrors": [
+    {
+      "description": "Lorem ipsum dolor sit amet consectetur adipiscing elit. Fusce at arcu lectus. Nam lorem nibh pretium a nisi a viverra consectetur dui. In ac tincidunt libero. Pellentesque pulvinar justo vitae molestie",
+      "detailedDescription": "nibh",
+      "failingComponent": "Lorem",
+      "errorType": {
+        "identifier": "nunc",
+        "namespace": "Ana"
+      },
+      "cause": {
+        "message": "ac",
+        "class": "ac"
+      }
+    }
+  ]
+}

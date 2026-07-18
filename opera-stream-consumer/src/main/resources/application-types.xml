@@ -1,0 +1,124 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<types:mule xmlns:types="http://www.mulesoft.org/schema/mule/types">
+  <types:catalog>
+    <types:type name="OAuth2TokenResponse" format="json">
+      <types:shape format="json-schema" location="schemas/OAuth2TokenResponse-1.json"/>
+    </types:type>
+    <types:type name="OffsetRecord" format="json">
+      <types:shape format="json-schema" location="schemas/OffsetRecord.json"/>
+    </types:type>
+    <types:type name="SubscribeInput" format="json">
+      <types:shape format="json-schema" location="schemas/SubscribeInput.json"/>
+    </types:type>
+    <types:type name="BusinessEventFrame" format="json">
+      <types:shape format="json-schema" location="schemas/BusinessEventFrame.json"/>
+    </types:type>
+    <types:type name="SubscribeFrame" format="json">
+      <types:shape format="json-schema" location="schemas/SubscribeFrame.json"/>
+    </types:type>
+    <types:type name="EventsSincePersistCounter" format="java">
+      <types:shape format="raml"><![CDATA[#%RAML 1.0 DataType
+type: integer]]></types:shape>
+    </types:type>
+  </types:catalog>
+  <types:enrichment select="#oauth-token-request">
+    <types:processor-declaration>
+      <types:output-event>
+        <types:message>
+          <types:payload type="OAuth2TokenResponse"/>
+        </types:message>
+      </types:output-event>
+    </types:processor-declaration>
+  </types:enrichment>
+  <types:enrichment select="#fesgbe">
+    <types:processor-declaration>
+      <types:input-event>
+        <types:message>
+          <types:payload type="OAuth2TokenResponse"/>
+        </types:message>
+      </types:input-event>
+      <types:output-event>
+        <types:message>
+          <types:payload type="OAuth2TokenResponse"/>
+        </types:message>
+      </types:output-event>
+    </types:processor-declaration>
+  </types:enrichment>
+  <types:enrichment select="#offset-record-retrieve">
+    <types:processor-declaration>
+      <types:output-event>
+        <types:message>
+          <types:payload type="OffsetRecord"/>
+        </types:message>
+      </types:output-event>
+    </types:processor-declaration>
+  </types:enrichment>
+  <types:enrichment select="#subscribe-input-retrieve">
+    <types:processor-declaration>
+      <types:output-event>
+        <types:message>
+          <types:payload type="SubscribeInput"/>
+        </types:message>
+      </types:output-event>
+    </types:processor-declaration>
+  </types:enrichment>
+  <types:enrichment select="#events-since-persist-retrieve">
+    <types:processor-declaration>
+      <types:output-event>
+        <types:message>
+          <types:payload type="EventsSincePersistCounter"/>
+        </types:message>
+      </types:output-event>
+    </types:processor-declaration>
+  </types:enrichment>
+  <types:enrichment select="#stream-frame-listener">
+    <types:processor-declaration>
+      <types:output-event>
+        <types:message>
+          <types:payload type="BusinessEventFrame"/>
+        </types:message>
+      </types:output-event>
+    </types:processor-declaration>
+  </types:enrichment>
+  <types:enrichment select="#offset-record-retrieve-reconnect">
+    <types:processor-declaration>
+      <types:output-event>
+        <types:message>
+          <types:payload type="OffsetRecord"/>
+        </types:message>
+      </types:output-event>
+    </types:processor-declaration>
+  </types:enrichment>
+  <types:enrichment select="#build-subscribe-frame-transform">
+    <types:processor-declaration>
+      <types:input-event>
+        <types:message>
+          <types:payload type="BusinessEventFrame"/>
+        </types:message>
+      </types:input-event>
+      <types:output-event>
+        <types:message>
+          <types:payload type="SubscribeFrame"/>
+        </types:message>
+      </types:output-event>
+    </types:processor-declaration>
+  </types:enrichment>
+  <types:enrichment select="#weznkf">
+    <types:processor-declaration>
+      <types:input-event>
+        <types:message>
+          <types:payload type="BusinessEventFrame"/>
+        </types:message>
+      </types:input-event>
+    </types:processor-declaration>
+  </types:enrichment>
+  <types:enrichment select="#mgnepc">
+    <types:processor-declaration>
+      <types:input-event>
+        <types:message>
+          <types:payload type="SubscribeFrame"/>
+        </types:message>
+      </types:input-event>
+    </types:processor-declaration>
+  </types:enrichment>
+</types:mule>

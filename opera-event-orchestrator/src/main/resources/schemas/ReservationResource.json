@@ -1,0 +1,123 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "getReservation response subtree (rsv.json #/definitions/reservation) — only the paths the orchestrator transform reads.",
+  "type": "object",
+  "properties": {
+    "reservations": {
+      "type": "object",
+      "properties": {
+        "reservation": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "hotelId": { "type": "string" },
+              "reservationStatus": { "type": "string" },
+              "createDateTime": { "type": "string" },
+              "lastModifyDateTime": { "type": "string" },
+              "reservationIdList": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": { "type": "string" },
+                    "type": { "type": "string" }
+                  }
+                }
+              },
+              "roomStay": {
+                "type": "object",
+                "properties": {
+                  "arrivalDate": { "type": "string" },
+                  "departureDate": { "type": "string" },
+                  "guestCounts": {
+                    "type": "object",
+                    "properties": {
+                      "adults": { "type": "integer" },
+                      "children": { "type": "integer" }
+                    }
+                  },
+                  "currentRoomInfo": {
+                    "type": "object",
+                    "properties": {
+                      "roomType": { "type": "string" },
+                      "roomId": { "type": "string" }
+                    }
+                  },
+                  "total": {
+                    "type": "object",
+                    "properties": {
+                      "amountBeforeTax": { "type": "number" },
+                      "amountAfterTax": { "type": "number" },
+                      "currencyCode": { "type": "string" }
+                    }
+                  },
+                  "roomRates": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "ratePlanCode": { "type": "string" },
+                        "roomType": { "type": "string" },
+                        "start": { "type": "string" },
+                        "end": { "type": "string" },
+                        "total": {
+                          "type": "object",
+                          "properties": {
+                            "amountAfterTax": { "type": "number" },
+                            "currencyCode": { "type": "string" }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "reservationGuests": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "primary": { "type": "boolean" },
+                    "profileInfo": {
+                      "type": "object",
+                      "properties": {
+                        "profileIdList": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": { "id": { "type": "string" } }
+                          }
+                        },
+                        "profile": {
+                          "type": "object",
+                          "properties": {
+                            "customer": {
+                              "type": "object",
+                              "properties": {
+                                "personName": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "object",
+                                    "properties": {
+                                      "givenName": { "type": "string" },
+                                      "surname": { "type": "string" }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

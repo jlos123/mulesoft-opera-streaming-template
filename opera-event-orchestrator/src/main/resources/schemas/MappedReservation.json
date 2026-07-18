@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Output of the getReservation example transform.",
+  "type": "object",
+  "properties": {
+    "reservationId": { "type": "string" },
+    "hotelId": { "type": "string" },
+    "status": { "type": "string" },
+    "stay": {
+      "type": "object",
+      "properties": {
+        "arrival": { "type": "string" },
+        "departure": { "type": "string" },
+        "adults": { "type": "integer" },
+        "children": { "type": "integer" },
+        "roomType": { "type": "string" },
+        "roomNumber": { "type": "string" },
+        "totalBeforeTax": { "type": "number" },
+        "totalAfterTax": { "type": "number" },
+        "currency": { "type": "string" }
+      }
+    },
+    "rates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "ratePlan": { "type": "string" },
+          "roomType": { "type": "string" },
+          "from": { "type": "string" },
+          "to": { "type": "string" },
+          "amountAfterTax": { "type": "number" },
+          "currency": { "type": "string" }
+        }
+      }
+    },
+    "guests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "primary": { "type": "boolean" },
+          "profileId": { "type": "string" },
+          "first": { "type": "string" },
+          "last": { "type": "string" }
+        }
+      }
+    },
+    "audit": {
+      "type": "object",
+      "properties": {
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      }
+    }
+  }
+}

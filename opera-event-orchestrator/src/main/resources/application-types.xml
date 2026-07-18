@@ -1,0 +1,80 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<types:mule xmlns:types="http://www.mulesoft.org/schema/mule/types">
+  <types:catalog>
+    <types:type name="MappedReservation" format="json">
+      <types:shape format="json-schema" location="schemas/MappedReservation.json"/>
+    </types:type>
+    <types:type name="MappedProfile" format="json">
+      <types:shape format="json-schema" location="schemas/MappedProfile.json"/>
+    </types:type>
+    <types:type name="BusinessEvent" format="json">
+      <types:shape format="json-schema" location="schemas/BusinessEvent.json"/>
+    </types:type>
+    <types:type name="ProfileResource" format="json">
+      <types:shape format="json-schema" location="schemas/ProfileResource.json"/>
+    </types:type>
+    <types:type name="ReservationResource" format="json">
+      <types:shape format="json-schema" location="schemas/ReservationResource.json"/>
+    </types:type>
+    <types:type name="OAuth2TokenResponse" format="json">
+      <types:shape format="json-schema" location="schemas/OAuth2TokenResponse.json"/>
+    </types:type>
+  </types:catalog>
+  <types:enrichment select="#oauth-token-request">
+    <types:processor-declaration>
+      <types:output-event>
+        <types:message>
+          <types:payload type="OAuth2TokenResponse"/>
+        </types:message>
+      </types:output-event>
+    </types:processor-declaration>
+  </types:enrichment>
+  <types:enrichment select="#parse-business-event">
+    <types:processor-declaration>
+      <types:output-event>
+        <types:variables>
+          <types:variable name="businessEvent" type="BusinessEvent"/>
+        </types:variables>
+      </types:output-event>
+    </types:processor-declaration>
+  </types:enrichment>
+  <types:enrichment select="#cfqvyf">
+    <types:processor-declaration>
+      <types:input-event>
+        <types:variables>
+          <types:variable name="currentResource" type="ProfileResource"/>
+          <types:variable name="businessEvent" type="BusinessEvent"/>
+        </types:variables>
+      </types:input-event>
+      <types:output-event>
+        <types:message>
+          <types:payload type="MappedProfile"/>
+        </types:message>
+      </types:output-event>
+    </types:processor-declaration>
+  </types:enrichment>
+  <types:enrichment select="#wcfdwu">
+    <types:processor-declaration>
+      <types:input-event>
+        <types:variables>
+          <types:variable name="currentResource" type="ReservationResource"/>
+          <types:variable name="businessEvent" type="BusinessEvent"/>
+        </types:variables>
+      </types:input-event>
+      <types:output-event>
+        <types:message>
+          <types:payload type="MappedReservation"/>
+        </types:message>
+      </types:output-event>
+    </types:processor-declaration>
+  </types:enrichment>
+  <types:enrichment select="#vauqdd">
+    <types:processor-declaration>
+      <types:input-event>
+        <types:message>
+          <types:payload type="OAuth2TokenResponse"/>
+        </types:message>
+      </types:input-event>
+    </types:processor-declaration>
+  </types:enrichment>
+</types:mule>

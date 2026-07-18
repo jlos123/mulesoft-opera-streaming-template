@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["type"],
+  "properties": {
+    "id": { "type": "string" },
+    "type": { "type": "string" },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "object",
+          "properties": {
+            "newEvent": {
+              "type": "object",
+              "required": ["metadata", "moduleName", "eventName", "primaryKey", "timestamp"],
+              "properties": {
+                "metadata": {
+                  "type": "object",
+                  "required": ["offset", "uniqueEventId"],
+                  "properties": {
+                    "offset": { "type": "string" },
+                    "uniqueEventId": { "type": "string" }
+                  }
+                },
+                "moduleName": { "type": "string" },
+                "eventName": { "type": "string" },
+                "primaryKey": { "type": "string" },
+                "timestamp": { "type": "string" },
+                "hotelId": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

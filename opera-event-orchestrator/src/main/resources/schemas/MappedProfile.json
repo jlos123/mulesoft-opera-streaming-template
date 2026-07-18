@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Output of the getProfile example transform.",
+  "type": "object",
+  "properties": {
+    "profileId": { "type": "string" },
+    "profileType": { "type": "string" },
+    "status": { "type": "string" },
+    "names": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "first": { "type": "string" },
+          "middle": { "type": "string" },
+          "last": { "type": "string" }
+        }
+      }
+    },
+    "primaryEmail": { "type": "string" },
+    "primaryPhone": { "type": "string" },
+    "demographics": {
+      "type": "object",
+      "properties": {
+        "gender": { "type": "string" },
+        "birthDate": { "type": "string" },
+        "nationality": { "type": "string" },
+        "vipStatus": { "type": "string" }
+      }
+    },
+    "audit": {
+      "type": "object",
+      "properties": {
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      }
+    }
+  }
+}

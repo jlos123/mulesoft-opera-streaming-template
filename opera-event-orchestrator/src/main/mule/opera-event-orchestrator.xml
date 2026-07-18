@@ -12,9 +12,9 @@
     -->
     <sub-flow name="fetch-oauth-token-subflow" doc:name="Fetch OHIP OAuth Token">
         <!-- The x-app-key header value IS the Application Key (one OHIP credential). -->
-        <set-variable variableName="xAppKey" value="${secure::ohip.appKey}" doc:name="Load x-app-key (secure)" doc:description="Load the x-app-key credential" />
-        <set-variable variableName="enterpriseId" value="${secure::ohip.enterpriseId}" doc:name="Load enterpriseId (secure)" doc:description="Load the enterprise ID credential" />
-        <http:request method="POST" path="/oauth/v1/tokens" config-ref="ohip-oauth-http-config" doc:name="POST /oauth/v1/tokens" doc:description="Request a fresh OAuth token from Opera">
+        <set-variable variableName="xAppKey" value="${secure::ohip.appKey}" doc:name="Load x-app-key (secure)" doc:id="load-xappkey-fetch" doc:description="Load the x-app-key credential" />
+        <set-variable variableName="enterpriseId" value="${secure::ohip.enterpriseId}" doc:name="Load enterpriseId (secure)" doc:id="load-enterprise-id" doc:description="Load the enterprise ID credential" />
+        <http:request method="POST" path="/oauth/v1/tokens" config-ref="ohip-oauth-http-config" doc:name="POST /oauth/v1/tokens" doc:id="oauth-token-request" doc:description="Request a fresh OAuth token from Opera">
             <http:body><![CDATA[#[
                 "grant_type=client_credentials&scope=" ++ p('ohip.oauthScope')
             ]]]></http:body>
@@ -23,7 +23,7 @@
                 "Content-Type": "application/x-www-form-urlencoded"
             } ++ (if (isEmpty(vars.enterpriseId)) {} else {"enterpriseId": vars.enterpriseId})]]]></http:headers>
         </http:request>
-        <os:store key="'ohip-access-token'" objectStore="tokenStateOs" doc:name="Cache access token (cross-flow)" doc:description="Save the token for reuse across events">
+        <os:store key="'ohip-access-token'" objectStore="tokenStateOs" doc:name="Cache access token (cross-flow)" doc:description="Save the token for reuse across events" doc:id="vauqdd">
             <os:value><![CDATA[#[payload.access_token]]]></os:value>
         </os:store>
         <os:store key="'token-expires-at-epoch-ms'" objectStore="tokenStateOs" doc:name="Cache token expiry" doc:description="Save when the token will expire">
@@ -43,8 +43,8 @@
           calls need x-app-key on EVERY event. Setting it here guarantees vars.xAppKey is populated on the
           cached-token path too - otherwise getProfile/getReservation would send x-app-key: null and 401.
         -->
-        <set-variable variableName="xAppKey" value="${secure::ohip.appKey}" doc:name="Load x-app-key (secure)" doc:description="Load the x-app-key credential for the REST calls" />
-        <os:retrieve key="'token-expires-at-epoch-ms'" objectStore="tokenStateOs" target="tokenExpiresAt" doc:name="Load cached token expiry" doc:description="Read when the cached token expires">
+        <set-variable variableName="xAppKey" value="${secure::ohip.appKey}" doc:name="Load x-app-key (secure)" doc:id="load-xappkey-ensure" doc:description="Load the x-app-key credential for the REST calls" />
+        <os:retrieve key="'token-expires-at-epoch-ms'" objectStore="tokenStateOs" target="tokenExpiresAt" doc:name="Load cached token expiry" doc:id="load-token-expiry" doc:description="Read when the cached token expires">
             <os:default-value><![CDATA[#[0]]]></os:default-value>
         </os:retrieve>
         <choice doc:name="Refresh token if expired/expiring" doc:description="Fetch a new token only when needed">
@@ -52,7 +52,7 @@
                 <flow-ref name="fetch-oauth-token-subflow" doc:name="fetch-oauth-token-subflow" doc:description="Get a fresh OAuth token" />
             </when>
         </choice>
-        <os:retrieve key="'ohip-access-token'" objectStore="tokenStateOs" target="accessToken" doc:name="Load cached access token" doc:description="Read the current Bearer token" />
+        <os:retrieve key="'ohip-access-token'" objectStore="tokenStateOs" target="accessToken" doc:name="Load cached access token" doc:id="load-access-token" doc:description="Read the current Bearer token" />
     </sub-flow>
 
     <!--
@@ -83,8 +83,8 @@
         </anypoint-mq:subscriber>
         <try doc:name="Orchestrate (fetch current state, upsert; DLQ on failure)" doc:description="Re-fetch current resource state and upsert it">
             <!-- MQ body arrives as an application/json String; parse once and reuse. -->
-            <set-variable doc:name="Parse Business Event JSON" value="#[read(payload, 'application/json')]" variableName="businessEvent" mimeType="application/json" doc:description="Parse the queued event body" />
-            <flow-ref name="ensure-oauth-token-subflow" doc:name="Ensure OHIP OAuth Token" doc:description="Get a valid Bearer token" />
+            <set-variable doc:name="Parse Business Event JSON" doc:id="parse-business-event" value="#[read(payload, 'application/json')]" variableName="businessEvent" mimeType="application/json" doc:description="Parse the queued event body" />
+            <flow-ref name="ensure-oauth-token-subflow" doc:name="Ensure OHIP OAuth Token" doc:id="ensure-token-ref" doc:description="Get a valid Bearer token" />
             <try doc:name="Fetch current resource state (404 = deleted)" doc:description="GET the latest resource; treat 404 as a delete">
                 <choice doc:name="Route by moduleName" doc:description="Pick the OHIP REST resource for this event">
                     <!--
@@ -97,7 +97,7 @@
                       sparse (no emails/telephones/memberships). Tune the list in config.properties.
                     -->
                     <when expression="#[upper(vars.businessEvent.moduleName default '') == 'PROFILE']" doc:description="Profile event, so GET the current profile state from OHIP">
-                        <http:request method="GET" path="/crm/v1/profiles/{profileId}" config-ref="ohip-rest-http-config" target="currentResource" doc:name="getProfile" doc:description="Fetch current profile state">
+                        <http:request method="GET" path="/crm/v1/profiles/{profileId}" config-ref="ohip-rest-http-config" target="currentResource" doc:id="get-profile-request" doc:name="getProfile" doc:description="Fetch current profile state">
                             <http:headers><![CDATA[#[{
                                 "Authorization": "Bearer " ++ vars.accessToken,
                                 "x-app-key": vars.xAppKey,
@@ -110,31 +110,6 @@
                         <ee:transform doc:name="Transform" doc:id="cfqvyf" doc:description="Example profile transformation">
                             <ee:message >
                                 <ee:set-payload doc:name="Set payload" doc:id="dshbxq" ><![CDATA[%dw 2.0
-// =====================================================================================================
-// EXAMPLE — accessing getProfile fields in a Transform Message
-// -----------------------------------------------------------------------------------------------------
-// Source call : GET /crm/v1/profiles/{profileId}   (operationId getProfile, crm.json)
-// Response    : the `profile` definition. Field paths below are taken verbatim from crm.json:
-//                 profile
-//                   .profileIdList[]            (uniqueID_Type: {id, type, idExtension})
-//                   .profileDetails            (profileType)
-//                       .customer              (customerType)
-//                           .personName[]      (personNameType: givenName, surname, namePrefix, ...)
-//                           .gender/.birthDate/.language/.nationality/.vipStatus
-//                       .emails.emailInfo[]    (emailInfoType -> email.emailAddress, email.primaryInd)
-//                       .telephones.telephoneInfo[] (telephoneInfoType -> telephone.phoneNumber, ...)
-//                       .profileType           (enum: Guest | Company | Agent | Group | Source | ...)
-//                       .statusCode            (enum: Active | Inactive)
-//                       .createDateTime / .lastModifyDateTime
-//
-// How to use: at the [PLUG-IN] point in opera-event-orchestrator.xml the getProfile body is in
-//             `vars.currentResource`. Put this script in a <ee:transform>. If you instead transform
-//             inline right after the http:request (no target), replace `vars.currentResource` with `payload`.
-//
-// ponytail: emails / telephones / addresses / memberships etc. are populated ONLY when the matching
-//           getProfile `fetchInstructions` query param is sent (Communication, Address, Membership, ...).
-//           Without them OHIP returns a sparse profile, so every deep path here is null-safe (default []/null).
-// =====================================================================================================
 output application/json
 // Alias the deep path once so the mapping below stays readable. `.` navigation is null-safe in DataWeave:
 // if `profileDetails` is missing, `p.customer.gender` is just null rather than an error.
@@ -191,7 +166,7 @@ var p = vars.currentResource.profileDetails
                           fetchInstructions selects which reservation sections OHIP returns; without it the response
                           is sparse (no roomRates/reservationGuests/totals). Tune the list in config.properties.
                         -->
-                        <http:request method="GET" path="/rsv/v1/hotels/{hotelId}/reservations/{reservationId}" config-ref="ohip-rest-http-config" target="currentResource" doc:name="getReservation" doc:description="Fetch current reservation state">
+                        <http:request method="GET" path="/rsv/v1/hotels/{hotelId}/reservations/{reservationId}" config-ref="ohip-rest-http-config" target="currentResource" doc:id="get-reservation-request" doc:name="getReservation" doc:description="Fetch current reservation state">
                             <http:headers><![CDATA[#[{
                                 "Authorization": "Bearer " ++ vars.accessToken,
                                 "x-app-key": vars.xAppKey,

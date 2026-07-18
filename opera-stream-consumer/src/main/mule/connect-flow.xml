@@ -23,7 +23,7 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
         <!-- The x-app-key header value IS the Application Key (one OHIP credential); same ohip.appKey used raw here and SHA-256-hashed for the ?key= handshake param below. -->
         <set-variable variableName="xAppKey" value="${secure::ohip.appKey}" doc:name="Load x-app-key (secure)" doc:description="Load the x-app-key credential" />
         <set-variable variableName="enterpriseId" value="${secure::ohip.enterpriseId}" doc:name="Load enterpriseId (secure)" doc:description="Load the enterprise ID credential" />
-        <http:request method="POST" path="/oauth/v1/tokens" config-ref="ohip-oauth-http-config" doc:name="POST /oauth/v1/tokens" doc:description="Request a fresh OAuth token from Opera">
+        <http:request method="POST" path="/oauth/v1/tokens" config-ref="ohip-oauth-http-config" doc:id="oauth-token-request" doc:name="POST /oauth/v1/tokens" doc:description="Request a fresh OAuth token from Opera">
             <http:body><![CDATA[#[
                 "grant_type=client_credentials&scope=" ++ p('ohip.oauthScope')
             ]]]></http:body>
@@ -32,7 +32,7 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
                 "Content-Type": "application/x-www-form-urlencoded"
             } ++ (if (isEmpty(vars.enterpriseId)) {} else {"enterpriseId": vars.enterpriseId})]]]></http:headers>
         </http:request>
-        <ee:transform doc:name="Extract token fields" doc:description="Pull the access token and expiry out of the response">
+        <ee:transform doc:name="Extract token fields" doc:description="Pull the access token and expiry out of the response" doc:id="fesgbe">
             <ee:variables>
                 <ee:set-variable variableName="accessToken"><![CDATA[%dw 2.0
 output application/java
@@ -79,13 +79,13 @@ payload.expires_in]]></ee:set-variable>
         <os:contains key="'offset-record'" objectStore="offsetStateOs" target="hasOffsetRecord" doc:name="Has stored Offset record?" doc:description="Check whether a saved Offset exists" />
         <choice doc:name="Load Offset record if present" doc:description="Resume from a saved Offset, or start fresh">
             <when expression="#[vars.hasOffsetRecord]" doc:description="A saved Offset exists, so load it to resume from where we left off">
-                <os:retrieve key="'offset-record'" objectStore="offsetStateOs" target="offsetRecord" doc:name="Retrieve Offset record" doc:description="Load the last saved Offset" />
+                <os:retrieve key="'offset-record'" objectStore="offsetStateOs" target="offsetRecord" doc:id="offset-record-retrieve" doc:name="Retrieve Offset record" doc:description="Load the last saved Offset" />
             </when>
             <otherwise>
                 <set-variable variableName="offsetRecord" value="#[null]" doc:name="No Offset record (first run)" doc:description="Mark this as a first-time connection" />
             </otherwise>
         </choice>
-        <ee:transform doc:name="Resolve gap-based subscribe input" doc:description="Build the subscribe payload from the Offset">
+        <ee:transform doc:id="resolve-subscribe-input-transform" doc:name="Resolve gap-based subscribe input" doc:description="Build the subscribe payload from the Offset">
             <ee:variables>
                 <ee:set-variable variableName="subscribeInput" resource="dw/resolve-subscribe-input.dwl" />
             </ee:variables>
@@ -174,22 +174,22 @@ payload.expires_in]]></ee:set-variable>
       Routes each frame by its graphql-transport-ws "type".
     -->
     <flow name="ohip-stream-intake-flow" maxConcurrency="1" doc:name="OHIP Stream Intake">
-        <websocket:outbound-listener path="/subscriptions" config-ref="ohip-stream-ws-config" doc:name="On Stream Frame" doc:description="Trigger on Opera event" outputMimeType="application/json"/>
+        <websocket:outbound-listener path="/subscriptions" config-ref="ohip-stream-ws-config" doc:id="stream-frame-listener" doc:name="On Stream Frame" doc:description="Trigger on Opera event" outputMimeType="application/json"/>
         <!-- The socket id comes from the source's own attributes; flow vars from connect-subflow are NOT in scope here. -->
         <set-variable variableName="socketId" value="#[attributes.socketId]" doc:name="Capture socket id from source" doc:description="Note which socket this frame came from" />
         <choice doc:name="Route by frame type" doc:description="Handle the frame differently based on its type">
-            <when expression="#[payload.'type' == 'connection_ack']" doc:description="Server accepted the connection, so send the event subscribe">
+            <when expression="#[payload.'type' == 'connection_ack']" doc:description="Server accepted the connection, so send the event subscribe" doc:id="weznkf">
                 <logger level="INFO" doc:name="Log connection_ack" doc:description="Log that Opera accepted the connection" message="connection_ack received; sending subscribe" />
                 <!-- subscription id + subscribe input were stashed by connect-subflow; retrieve for this event. -->
                 <os:retrieve key="'subscription-id'" objectStore="currentSocketOs" target="subscriptionId" doc:name="Retrieve subscription id" doc:description="Load the subscription ID for this connection" />
-                <os:retrieve key="'subscribe-input'" objectStore="currentSocketOs" target="subscribeInput" doc:name="Retrieve subscribe input" doc:description="Load the subscribe payload for this connection" />
-                <ee:transform doc:name="Build subscribe frame" doc:description="Build the subscribe request frame">
+                <os:retrieve key="'subscribe-input'" objectStore="currentSocketOs" target="subscribeInput" doc:id="subscribe-input-retrieve" doc:name="Retrieve subscribe input" doc:description="Load the subscribe payload for this connection" />
+                <ee:transform doc:id="build-subscribe-frame-transform" doc:name="Build subscribe frame" doc:description="Build the subscribe request frame">
                     <ee:message>
                         <ee:set-payload resource="dw/subscribe-frame.dwl" />
                     </ee:message>
                 </ee:transform>
                 <!-- payload is already application/json (from subscribe-frame.dwl); send verbatim, no re-encode. -->
-                <websocket:send socketId="#[vars.socketId]" config-ref="ohip-stream-ws-config" doc:name="Send subscribe" doc:description="Subscribe to Opera Business Events">
+                <websocket:send socketId="#[vars.socketId]" config-ref="ohip-stream-ws-config" doc:name="Send subscribe" doc:description="Subscribe to Opera Business Events" doc:id="mgnepc">
                     <websocket:content>#[payload]</websocket:content>
                 </websocket:send>
             </when>
@@ -229,7 +229,7 @@ payload.expires_in]]></ee:set-variable>
                   the per-event cost is a local read+write, not a network round-trip. Set persistEveryNEvents=1 to
                   restore per-event durability. Offset still stored as an opaque String.
                 -->
-                <os:retrieve key="'events-since-persist'" objectStore="currentSocketOs" target="eventsSincePersist" doc:name="Load events-since-persist counter" doc:description="Events seen since the last durable checkpoint">
+                <os:retrieve key="'events-since-persist'" objectStore="currentSocketOs" target="eventsSincePersist" doc:id="events-since-persist-retrieve" doc:name="Load events-since-persist counter" doc:description="Events seen since the last durable checkpoint">
                     <os:default-value><![CDATA[#[0]]]></os:default-value>
                 </os:retrieve>
                 <choice doc:name="Checkpoint Offset every N events" doc:description="Flush the Offset to durable storage on the Nth event">

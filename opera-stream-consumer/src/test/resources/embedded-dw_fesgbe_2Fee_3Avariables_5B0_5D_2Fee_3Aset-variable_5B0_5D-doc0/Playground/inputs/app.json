@@ -1,0 +1,9 @@
+{
+  "encoding": "ut",
+  "name": "Clair",
+  "standalone": false,
+  "workDir": "dictum",
+  "registry": {
+    "entry": "arcu"
+  }
+}
