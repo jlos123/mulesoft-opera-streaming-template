@@ -10,9 +10,12 @@
 *.ear
 velocity.log
 
+
 # --- Real secrets (only the *.sample pair is ever tracked) ---
 **/src/main/resources/secure.properties
-
+local.properties
+local.secure.properties
+secure.properties
 # --- Node (the OHIP simulator) ---
 **/node_modules/
 

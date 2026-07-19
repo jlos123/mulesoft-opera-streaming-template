@@ -36,8 +36,19 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
         -->
         <os:contains key="'ha-subscribed'" objectStore="haStateOs" target="hadHaSubscribed" doc:name="Was HA-active?" doc:description="Did this instance hold the stream" />
         <choice doc:name="Clear ha-subscribed if present"><when expression="#[vars.hadHaSubscribed]" doc:description="We held the stream, so clear the flag to re-arm the failover poller"><os:remove key="'ha-subscribed'" objectStore="haStateOs" doc:name="Clear ha-subscribed" doc:description="No longer holding the stream" /></when></choice>
-        <os:contains key="'ha-takeover-not-before'" objectStore="haStateOs" target="hadTakeoverSched" doc:name="Takeover scheduled?" doc:description="Was a takeover queued on the dead socket" />
-        <choice doc:name="Clear ha-takeover if present"><when expression="#[vars.hadTakeoverSched]" doc:description="A takeover was queued on the now-dead socket, so cancel it"><os:remove key="'ha-takeover-not-before'" objectStore="haStateOs" doc:name="Clear ha-takeover-not-before" doc:description="Stale after socket drop" /></when></choice>
+        <!--
+          ha-takeover-not-before is deliberately NOT cleared here. It is a wall-clock deadline ("earliest
+          time this instance may try to acquire the lock"), not state tied to this particular socket - OHIP
+          was observed closing the status-probe socket ~20-400ms after the status reply, i.e. almost always
+          BEFORE the jittered delay elapses. Clearing it on every socket close cancelled the scheduled
+          takeover before ha-failover-controller-flow ever got a chance to act on it, which was the actual
+          cause of an endless probe/close churn under HA that never reached a takeover attempt. The only
+          things that should cancel a scheduled takeover are: it firing (ha-failover-flow.xml case (a)
+          removes it), or status going back to Active (ha-handle-status-subflow's otherwise branch removes
+          it) - both already handled elsewhere.
+        -->
+        <os:contains key="'ha-takeover-inflight'" objectStore="haStateOs" target="hadTakeoverInflight" doc:name="Was a takeover connect inflight?" doc:description="Did this socket belong to a takeover attempt that never reached connection_ack" />
+        <choice doc:name="Clear ha-takeover-inflight if present"><when expression="#[vars.hadTakeoverInflight]" doc:description="The takeover's connect socket died before its ack could subscribe, so clear the marker"><os:remove key="'ha-takeover-inflight'" objectStore="haStateOs" doc:name="Clear ha-takeover-inflight" doc:description="Stale after socket drop; the next poll tick will reschedule the takeover" /></when></choice>
         <os:contains key="'offset-record'" objectStore="offsetStateOs" target="hasOffsetRecord" doc:name="Has stored Offset record?" doc:description="Check for a saved Offset" />
         <choice doc:name="Update lastConnectedAt if record exists" doc:description="Record when the connection last dropped">
             <when expression="#[vars.hasOffsetRecord]" doc:description="A saved Offset exists, so stamp it with the disconnect time">
@@ -109,14 +120,15 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
                     <when expression="#[(now() as Number {unit: 'milliseconds'}) &gt;= vars.notBeforeEpochMs]" doc:description="The backoff wait has elapsed, so attempt the reconnect now">
                         <logger level="INFO" doc:name="Log reconnecting" doc:description="Log that the wait is over and reconnecting now" message="Reconnect wait elapsed; reconnecting now." />
                         <!--
-                          Clear the pending flag ONLY on a successful connect. If connect-subflow throws (token
-                          endpoint down, socket refused), the flag stays set and we push the not-before timestamp
-                          out by one poll interval so the scheduler retries instead of wedging permanently.
+                          connect-subflow's own success path now clears reconnect-pending / reconnect-not-
+                          before-epoch-ms itself (any successful connect, from any caller, supersedes a queued
+                          reconnect - see its comment in connect-flow.xml). Do NOT also remove them here: they're
+                          already gone by the time flow-ref returns, and a second os:remove on a missing key
+                          throws OS:KEY_NOT_FOUND. On failure they're untouched (still set), so the error
+                          handler below can push the retry out by one interval as before.
                         -->
                         <try doc:name="Attempt reconnect" doc:description="Try to reconnect, retrying later on failure">
                             <flow-ref name="connect-subflow" doc:name="Reconnect now" doc:description="Reopen the connection to Opera" />
-                            <os:remove key="'reconnect-pending'" objectStore="reconnectStateOs" doc:name="Clear reconnect-pending flag (success)" doc:description="Reconnect succeeded, clear the pending flag" />
-                            <os:remove key="'reconnect-not-before-epoch-ms'" objectStore="reconnectStateOs" doc:name="Clear not-before timestamp (success)" doc:description="Clean up the retry timestamp" />
                             <error-handler>
                                 <on-error-continue doc:name="Connect failed - keep pending, back off one interval" doc:description="Reconnect failed, so try again on the next tick">
                                     <logger level="WARN" doc:name="Log reconnect failure" doc:description="Log why the reconnect attempt failed"

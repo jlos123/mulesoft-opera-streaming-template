@@ -21,7 +21,11 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
 
         1. open the Stream socket and send connection_init  (connect-subflow, unchanged)
         2. run `query { connection { id status } }`         (ha-send-status-query-subflow)
-        3. only send the EVENT subscribe when status==Inactive, after a jittered delay
+        3. after a jittered delay, RECONNECT (not: resend on the same socket) and send the EVENT
+           subscribe on that new connection's own ack (ha-failover-controller-flow case (a),
+           ha-takeover-inflight). OHIP was observed force-closing the status-probe socket within
+           ~20-400ms of the status reply - well before the jittered delay elapses - so the probe
+           socket cannot be relied on to still be open when the takeover fires.
         4. whoever's subscribe lands first wins the Single-Consumer Lock; the losers get 4409 and
            the base reconnect-flow backs off (2min+jitter) and re-probe.
 
@@ -43,18 +47,35 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
       Send Oracle's connection-status query over the live probe socket. The graphql-transport-ws
       transport has no dedicated "query" frame, so a GraphQL query is sent as a `subscribe` op with a
       fresh id; OHIP replies with a single `next` frame carrying payload.data.connection.{id,status},
-      routed by the connection-status branch in connect-flow.xml's intake router. Requires a live
-      current-socket-id (caller guarantees it).
+      routed by the connection-status branch in connect-flow.xml's intake router.
+
+      Callable right after connection_ack (connect-flow.xml's ack router) OR as a routine re-poll
+      (ha-failover-controller-flow case (c)). In the ack case there is a genuine race: OHIP was observed
+      closing a probe socket within ~20-400ms of any response on it, and the ack frame and the close event
+      for the SAME socket are handled by two separate flows (ohip-stream-intake-flow vs
+      ohip-on-socket-closed-flow) that can run concurrently. If the close-handler's os:remove wins that
+      race, current-socket-id is already gone by the time this subflow runs - guarded here (rather than
+      requiring the caller to guarantee a live socket) so that lost race degrades to a harmless no-op
+      instead of an unhandled OS:KEY_NOT_FOUND. The controller's own poller (or the close-handler's
+      reconnect scheduling) drives the next attempt regardless.
     -->
     <sub-flow name="ha-send-status-query-subflow" doc:name="HA Send Status Query">
-        <os:retrieve key="'current-socket-id'" objectStore="currentSocketOs" target="haSocketId" doc:name="Retrieve current socket id" doc:description="Load the live probe socket" />
-        <websocket:send socketId="#[vars.haSocketId]" config-ref="ohip-stream-ws-config" doc:name="Send connection-status query" doc:description="Ask OHIP whether the stream is already held">
-            <websocket:content><![CDATA[#[output application/json --- {
-                id: uuid(),
-                'type': "subscribe",
-                payload: { query: "query { connection { id status } }" }
-            }]]]></websocket:content>
-        </websocket:send>
+        <os:contains key="'current-socket-id'" objectStore="currentSocketOs" target="hasSocket" doc:name="Has live socket?" doc:description="Check the probe socket is still tracked before using it" />
+        <choice doc:name="Only send if the socket is still tracked" doc:description="Skip if the socket already closed in the race described above">
+            <when expression="#[vars.hasSocket]" doc:description="Socket still tracked, so send the status query">
+                <os:retrieve key="'current-socket-id'" objectStore="currentSocketOs" target="haSocketId" doc:name="Retrieve current socket id" doc:description="Load the live probe socket" />
+                <websocket:send socketId="#[vars.haSocketId]" config-ref="ohip-stream-ws-config" doc:name="Send connection-status query" doc:description="Ask OHIP whether the stream is already held">
+                    <websocket:content><![CDATA[#[output application/json --- {
+                        id: uuid(),
+                        'type': "subscribe",
+                        payload: { query: "query { connection { id status } }" }
+                    }]]]></websocket:content>
+                </websocket:send>
+            </when>
+            <otherwise>
+                <logger level="DEBUG" doc:name="Log skipped status query" doc:description="Socket already closed before this could send" message="Socket already closed (lost the ack/close race); skipping status query." />
+            </otherwise>
+        </choice>
     </sub-flow>
 
     <!--
@@ -132,19 +153,31 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
                         <os:contains key="'ha-takeover-not-before'" objectStore="haStateOs" target="hasTakeover" doc:name="Takeover scheduled?" doc:description="Are we waiting to subscribe" />
                         <choice doc:name="Passive state machine" doc:description="Probe -> poll -> take over">
                             <!--
-                              (a) Takeover is scheduled AND due AND we still hold a socket -> attempt the event
-                              subscribe. If we win, a Business Event arrives and marks ha-subscribed. If we lose
-                              the race, OHIP closes 4409 and the base reconnect-flow backs off + re-probes.
+                              (a) Takeover is due -> open a FRESH connect and subscribe on ITS OWN ack, rather
+                              than sending subscribe on the old probe socket. OHIP was observed force-closing the
+                              probe socket (close code 1000) within ~20-400ms of the status reply, almost always
+                              before the 1-5s jittered delay elapses - so by the time this poller next runs
+                              (every ohip.ha.statusPollIntervalMs, default 15s), the probe socket is already
+                              gone. Deliberately does NOT require vars.hasSocket: connect-subflow opens its own
+                              socket regardless, and the connector already force-closes any stale same-id socket
+                              first (see SocketRegistry "Replacing stale WebSocket" in the logs). ha-takeover-
+                              inflight tells connect-flow.xml's ack router to subscribe immediately on this
+                              connect instead of re-probing status. Guarded on not-connecting so this doesn't
+                              fire a duplicate connect-subflow on top of one already underway from case (b) or
+                              from reconnect-scheduler-flow's own close-code-driven reconnect; if skipped for
+                              that reason, the still-scheduled takeover is simply retried on the next poll tick.
                             -->
-                            <when expression="#[vars.hasTakeover and vars.hasSocket]" doc:description="Takeover is scheduled and we have a socket, so subscribe once it's due">
+                            <when expression="#[vars.hasTakeover and not vars.connecting]" doc:description="Takeover is scheduled and nothing else is already connecting, so reconnect and subscribe once it's due">
                                 <os:retrieve key="'ha-takeover-not-before'" objectStore="haStateOs" target="notBefore" doc:name="Load takeover not-before" doc:description="Earliest allowed subscribe time" />
                                 <choice doc:name="If takeover due" doc:description="Wait out the role-biased delay">
-                                    <when expression="#[(now() as Number {unit: 'milliseconds'}) &gt;= (vars.notBefore as Number)]" doc:description="Takeover delay has elapsed, so send the event subscribe now">
+                                    <when expression="#[(now() as Number {unit: 'milliseconds'}) &gt;= (vars.notBefore as Number)]" doc:description="Takeover delay has elapsed, so reconnect and subscribe now">
                                         <os:remove key="'ha-takeover-not-before'" objectStore="haStateOs" doc:name="Consume takeover schedule" doc:description="Clear so we don't re-fire" />
-                                        <os:retrieve key="'current-socket-id'" objectStore="currentSocketOs" target="socketId" doc:name="Retrieve socket id" doc:description="Socket to subscribe on" />
+                                        <os:store key="'ha-takeover-inflight'" objectStore="haStateOs" doc:name="Mark takeover connect inflight" doc:description="Tell the ack router to subscribe immediately on this connect">
+                                            <os:value><![CDATA[#[true]]]></os:value>
+                                        </os:store>
                                         <logger level="INFO" doc:name="Log taking over" doc:description="Attempting to acquire the stream"
-                                                message="Takeover due; sending event subscribe to acquire the stream (other instances, if any, win/lose the 4409 race)." />
-                                        <flow-ref name="send-event-subscribe-subflow" doc:name="Send Event Subscribe" doc:description="Attempt to acquire the Single-Consumer Lock" />
+                                                message="Takeover due; reconnecting to acquire the stream (other instances, if any, win/lose the 4409 race)." />
+                                        <flow-ref name="connect-subflow" doc:name="connect-subflow" doc:description="Fresh connect; its own ack will subscribe (see ha-takeover-inflight)" />
                                     </when>
                                     <otherwise>
                                         <logger level="DEBUG" doc:name="Takeover not yet due" doc:description="Still within the delay window" message="Takeover scheduled but not yet due; waiting." />

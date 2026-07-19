@@ -68,8 +68,8 @@ Get a sandbox chain streaming events onto Anypoint MQ in about 15 minutes.
    the consumer's **standard queue** (`ohip.mq.consumerDestination`) and **bind it to that exchange**. Grab an MQ client-app `clientId`/`clientSecret`. Publishing to an exchange
    lets you fan out to additional consumers later by binding more queues — no publisher change.
 3. **Fill in the config.** Edit `src/main/resources/config.properties` with your host, port,
-   and `ohip.chainCode`. Copy `secure.properties.sample` → `secure.properties` and fill in the
-   real secrets from steps 1 and 2.
+   and `ohip.chainCode`. Copy `secure.properties.sample` → `local.secure.properties` and fill in
+   the real secrets from steps 1 and 2.
 4. **Encrypt the secrets** with the MuleSoft Secure Properties Tool using a master key of your
    choosing (see [Setting up Secure Properties](#setting-up-secure-properties) below).
 5. **Optional: build and deploy locally against the simulator.**
@@ -172,13 +172,17 @@ have a reason to (e.g. a stricter SLA, or Oracle changes a documented timing).
 
 ### Setting up Secure Properties
 
-1. Copy `secure.properties.sample` to `secure.properties` and fill in real values.
+1. Copy `secure.properties.sample` to `local.secure.properties` and fill in real values.
 2. Encrypt it with the [MuleSoft Secure Properties Tool](https://docs.mulesoft.com/mule-runtime/latest/secure-configuration-properties)
-   using your own master key (matching `global.xml`'s `algorithm="Blowfish" mode="CBC"`):
+   using your own master key (matching `global.xml`'s `algorithm="Blowfish" mode="CBC"`), writing
+   to a separate output file (`file` mode truncates its output file before reading the input, so
+   input and output **must not** be the same path):
    ```
    java -cp secure-properties-tool-j17.jar com.mulesoft.tools.SecurePropertiesTool \
-     file encrypt Blowfish CBC <your-master-key> secure.properties secure.properties
+     file encrypt Blowfish CBC <your-master-key> local.secure.properties secure.properties
    ```
+   `local.secure.properties` is git-ignored — keep your unencrypted working copy there so you can
+   re-encrypt after edits without regenerating it from scratch.
 3. Deploy with the master key as a system property: `-Dmule.key=<your-master-key>`. For a launch
    configuration instead of the command line, see
    [Anypoint Code Builder](https://docs.mulesoft.com/anypoint-code-builder/int-run-mule-apps-with-properties#use-environment-variables-in-launch-configurations)

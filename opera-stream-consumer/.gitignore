@@ -21,8 +21,6 @@ tmp/**/*
 *.swp
 *~.nib
 local.properties
-local.secure.properties
-secure.properties
 .settings/
 .loadpath
 .project

@@ -137,7 +137,9 @@ Current defaults target **moderate volume**. Knobs, in the order you'd reach for
 ## Configuration
 
 Non-secret values in `src/main/resources/config.properties`; secrets in `secure.properties` (never
-committed — copy `secure.properties.sample`, fill in, and encrypt).
+committed — copy `secure.properties.sample` to `local.secure.properties`, fill in, and encrypt to
+`secure.properties`; see [`opera-stream-consumer`'s Setting up Secure Properties](../opera-stream-consumer/README.md#setting-up-secure-properties)
+for the exact command).
 
 | Property | Description |
 |---|---|
