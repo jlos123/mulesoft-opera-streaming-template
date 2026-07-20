@@ -51,7 +51,6 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
     </websocket:config>
 
     <os:object-store name="currentSocketOs" persistent="false" doc:name="Current Socket Id (cross-flow)" />
-    <os:object-store name="reconnectStateOs" persistent="false" doc:name="Reconnect Wait State (cross-flow)" />
     <os:object-store name="tokenStateOs" persistent="false" doc:name="OAuth Token Expiry (cross-flow)" />
 
     <!--
@@ -61,6 +60,10 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
       shared store - so this must not be persistent/shared. Keys:
         'ha-subscribed'          (bool)     - true once THIS instance sent the event subscribe and holds the stream
         'ha-takeover-not-before' (epoch ms) - earliest time this instance may subscribe after seeing status Inactive
+        'halted'                 (bool)     - 4403 config-fatal halt flag (set in reconnect-flow.xml, read in
+                                              ha-failover-flow.xml). Non-persistent on purpose: a 4403 is fixed
+                                              in OHIP (chain/App Key), not in this artifact, so a restart or
+                                              redeploy should clear the halt and let the controller re-probe.
       See ha-failover-flow.xml and the connection_ack / connection-status handlers in connect-flow.xml.
     -->
     <os:object-store name="haStateOs" persistent="false" doc:name="HA competing-consumer state (cross-flow)" />

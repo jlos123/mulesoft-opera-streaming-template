@@ -46,28 +46,62 @@ payload.expires_in]]></ee:set-variable>
         </ee:transform>
         <logger level="INFO" doc:name="Log token obtained (redacted)" doc:description="Confirm a token was issued, without exposing it"
                 message="OAuth token obtained (expires_in=#[vars.tokenExpiresIn]s); token value redacted" />
+        <!--
+          Store the token value BEFORE its expiry key. connect-subflow's reuse path gates on
+          'token-expires-at-epoch-ms' being present and then retrieves 'access-token'; under overlapping
+          connects a second connect could otherwise see expiry-present and retrieve an 'access-token' that
+          this subflow hasn't written yet (OS:KEY_NOT_FOUND). Writing token first means "expiry present"
+          always implies "token present".
+        -->
+        <os:store key="'access-token'" objectStore="tokenStateOs" doc:name="Store access token (cross-flow, for reuse)" doc:description="Cache the token so passive probes don't re-fetch on every connect">
+            <os:value><![CDATA[#[vars.accessToken]]]></os:value>
+        </os:store>
         <os:store key="'token-expires-at-epoch-ms'" objectStore="tokenStateOs" doc:name="Store token expiry (cross-flow, for proactive refresh)" doc:description="Save when the token will expire">
             <os:value><![CDATA[#[(now() as Number {unit: 'milliseconds'}) + (vars.tokenExpiresIn as Number * 1000)]]]></os:value>
         </os:store>
     </sub-flow>
 
     <!--
-      Shared connect-subflow: fetch token, open the Stream socket, send connection_init. Reused by the
-      tracer bullet, the reconnect state machine, and proactive token refresh.
+      Shared connect-subflow: reuse a cached OAuth token (or fetch a fresh one), open the Stream socket,
+      send connection_init. The failover controller (ha-failover-flow.xml) is the sole caller - case (b)
+      opens a probe socket, case (a) opens a takeover connect - so the controller is the single driver of
+      every socket open.
     -->
     <sub-flow name="connect-subflow" doc:name="Connect Subflow">
         <!--
           Mark connect in-progress up front. connect-subflow only writes 'current-socket-id' at the very end
           (after connection_init), so without this marker a scheduler firing mid-connect sees "no socket" and
           launches a SECOND connect - which OHIP rejects with the Single-Consumer Lock (4409) and force-closes
-          the in-flight socket. The startup/reconnect guards skip while this marker is set. Always cleared in
+          the in-flight socket. The failover/reconnect guards skip while this marker is set. Always cleared in
           the error handler so a failed connect can't wedge the marker on.
         -->
         <os:store key="'connect-in-progress'" objectStore="currentSocketOs" doc:name="Mark connect in-progress" doc:description="Flag that a connection attempt is underway">
             <os:value><![CDATA[#[true]]]></os:value>
         </os:store>
         <try doc:name="Connect (clear in-progress marker on any outcome)" doc:description="Run the connect steps, clearing the in-progress flag either way">
-        <flow-ref name="fetch-oauth-token-subflow" doc:name="Fetch OAuth Token" doc:description="Get a fresh OAuth token" />
+        <!--
+          Reuse the cached token if it's present and outside the refresh lead time; a passive standby
+          probing every ~60s otherwise calls /oauth/v1/tokens on every probe. The lead time keeps this
+          comfortably ahead of proactive-token-refresh-scheduler-flow's own refresh, so an active
+          subscribe never gets handed a near-expiry token (OHIP closes the socket when it dies).
+        -->
+        <os:contains key="'token-expires-at-epoch-ms'" objectStore="tokenStateOs" target="hasCachedToken" doc:name="Has cached token?" doc:description="Check whether a cached OAuth token exists" />
+        <choice doc:name="Cached token still fresh?" doc:description="Skip if a cached token exists and isn't near expiry">
+            <when expression="#[vars.hasCachedToken]" doc:description="A cached expiry is tracked, so check whether it's still outside the refresh lead time">
+                <os:retrieve key="'token-expires-at-epoch-ms'" objectStore="tokenStateOs" target="cachedTokenExpiresAtEpochMs" doc:name="Retrieve cached token expiry" doc:description="Load when the cached token expires" />
+                <choice doc:name="Reuse or refetch" doc:description="Reuse only if outside the refresh lead time">
+                    <when expression="#[(now() as Number {unit: 'milliseconds'}) &lt; (vars.cachedTokenExpiresAtEpochMs - (p('ohip.tokenRefresh.leadTimeMs') as Number))]" doc:description="Cached token is fresh enough, so reuse it">
+                        <os:retrieve key="'access-token'" objectStore="tokenStateOs" target="accessToken" doc:name="Retrieve cached access token" doc:description="Reuse the cached OAuth token" />
+                    </when>
+                    <otherwise>
+                        <flow-ref name="fetch-oauth-token-subflow" doc:name="Fetch OAuth Token" doc:description="Cached token is near expiry or absent; get a fresh one" />
+                    </otherwise>
+                </choice>
+            </when>
+            <otherwise>
+                <flow-ref name="fetch-oauth-token-subflow" doc:name="Fetch OAuth Token" doc:description="No cached token; get a fresh one" />
+            </otherwise>
+        </choice>
         <set-variable variableName="appKey" value="${secure::ohip.appKey}" doc:name="Load Application Key (secure)" doc:description="Load the Application Key credential" />
         <!--
           dw::Crypto::hashWith takes Binary and returns Binary (raw digest bytes), NOT a hex string.
@@ -135,24 +169,18 @@ payload.expires_in]]></ee:set-variable>
         <os:store key="'current-socket-id'" objectStore="currentSocketOs" doc:name="Store current socket id (cross-flow)" doc:description="Record the live socket ID">
             <os:value><![CDATA[#[vars.streamSocketAttributes.socketId]]]></os:value>
         </os:store>
-            <!--
-              A successful connect - by ANY caller (startup, reconnect-scheduler-flow, or an HA takeover) -
-              makes any previously scheduled reconnect moot: we're already live on a fresh socket, so
-              reconnect-scheduler-flow must not fire it later. Without this, a reconnect queued by an earlier
-              (now-irrelevant) socket close was observed firing ~15s after an HA takeover had already
-              succeeded, force-closing the newly won/subscribed socket via the connector's same-socketId
-              replacement and restarting the whole HA cycle. Guarded: only reconnect-scheduler-flow's own
-              success path used to clear these, so a connect triggered by any other caller left them stale.
-            -->
-            <os:contains key="'reconnect-pending'" objectStore="reconnectStateOs" target="hadReconnectPending" doc:name="Reconnect was pending?" doc:description="Was an older reconnect queued before this connect succeeded" />
-            <choice doc:name="Clear stale reconnect-pending if present"><when expression="#[vars.hadReconnectPending]" doc:description="This connect supersedes it, so clear the queued reconnect"><os:remove key="'reconnect-pending'" objectStore="reconnectStateOs" doc:name="Clear reconnect-pending (superseded)" doc:description="No longer needed; we just connected" /></when></choice>
-            <os:contains key="'reconnect-not-before-epoch-ms'" objectStore="reconnectStateOs" target="hadReconnectNotBefore" doc:name="Reconnect timestamp was set?" doc:description="Was a retry time recorded before this connect succeeded" />
-            <choice doc:name="Clear stale reconnect-not-before if present"><when expression="#[vars.hadReconnectNotBefore]" doc:description="This connect supersedes it, so clear the retry timestamp"><os:remove key="'reconnect-not-before-epoch-ms'" objectStore="reconnectStateOs" doc:name="Clear reconnect-not-before-epoch-ms (superseded)" doc:description="No longer needed; we just connected" /></when></choice>
-            <!-- Clear the marker as the LAST step of the success path (inside the try). -->
-            <os:remove key="'connect-in-progress'" objectStore="currentSocketOs" doc:name="Clear connect in-progress (success)" doc:description="Clear the connecting flag now that we're live" />
+            <!-- Clear the marker as the LAST step of the success path (inside the try). Guarded: see the crash this fixes below. -->
+            <os:contains key="'connect-in-progress'" objectStore="currentSocketOs" target="hasConnectInProgress" doc:name="Connect-in-progress still set?" doc:description="Check before removing (overlapping connects can race this key away already)" />
+            <choice doc:name="Clear connect-in-progress if present (success)"><when expression="#[vars.hasConnectInProgress]" doc:description="Still set, so clear it now that we're live"><os:remove key="'connect-in-progress'" objectStore="currentSocketOs" doc:name="Clear connect in-progress (success)" doc:description="Clear the connecting flag now that we're live" /></when></choice>
             <error-handler>
                 <on-error-continue doc:name="Clear in-progress marker on failure" doc:description="Clean up the connecting flag after a failed attempt">
-                    <os:remove key="'connect-in-progress'" objectStore="currentSocketOs" doc:name="Clear connect in-progress (failure)" doc:description="Clear the connecting flag" />
+                    <!--
+                      Guarded: under overlapping connects, a second attempt's error handler can run after
+                      the first attempt already cleared this key, and an unconditional os:remove throws
+                      OS:KEY_NOT_FOUND.
+                    -->
+                    <os:contains key="'connect-in-progress'" objectStore="currentSocketOs" target="hasConnectInProgressOnError" doc:name="Connect-in-progress still set?" doc:description="Check before removing" />
+                    <choice doc:name="Clear connect-in-progress if present (failure)"><when expression="#[vars.hasConnectInProgressOnError]" doc:description="Still set, so clear it"><os:remove key="'connect-in-progress'" objectStore="currentSocketOs" doc:name="Clear connect in-progress (failure)" doc:description="Clear the connecting flag" /></when></choice>
                     <!--
                       If this connect attempt was a scheduled HA takeover (ha-failover-controller-flow sets
                       ha-takeover-inflight before calling connect-subflow), and it fails before a socket ever
@@ -172,8 +200,8 @@ payload.expires_in]]></ee:set-variable>
       Retrieves the subscription id + resolved subscribe input stashed by connect-subflow, builds the
       newEvent subscribe frame, and sends it. THIS send is what acquires OHIP's Single-Consumer Lock:
       exactly one instance's subscribe wins; any other instance's subscribe is rejected with 4409.
-      Extracted so BOTH the non-HA connection_ack path (subscribe immediately) and the HA takeover path
-      (subscribe only after a status check says Inactive, ha-failover-flow.xml) use identical logic.
+      Called only after a status check says Inactive (ha-failover-flow.xml's takeover path, or the
+      takeover-inflight ack branch below).
     -->
     <sub-flow name="send-event-subscribe-subflow" doc:name="Send Event Subscribe">
         <os:retrieve key="'subscription-id'" objectStore="currentSocketOs" target="subscriptionId" doc:name="Retrieve subscription id" doc:description="Load the subscription ID for this connection" />
@@ -196,44 +224,12 @@ payload.expires_in]]></ee:set-variable>
           response - destroying a subscription we already won, forever, every poll interval. Self-corrects if
           this send actually LOST the race: OHIP then closes the socket with 4409, and
           ohip-on-socket-closed-flow unconditionally clears ha-subscribed on any close, so a false-positive
-          mark here never survives past that round trip. Gated on ha.enabled since haStateOs is HA-only.
+          mark here never survives past that round trip.
         -->
-        <choice doc:name="Mark HA active if in HA mode" doc:description="Only relevant when HA is enabled">
-            <when expression="#[p('ohip.ha.enabled') == 'true']" doc:description="HA mode, so optimistically mark this instance active">
-                <os:store key="'ha-subscribed'" objectStore="haStateOs" doc:name="Mark HA active (optimistic, post-subscribe)" doc:description="Assume we hold the stream until proven otherwise by a 4409 close">
-                    <os:value><![CDATA[#[true]]]></os:value>
-                </os:store>
-            </when>
-        </choice>
+        <os:store key="'ha-subscribed'" objectStore="haStateOs" doc:name="Mark HA active (optimistic, post-subscribe)" doc:description="Assume we hold the stream until proven otherwise by a 4409 close">
+            <os:value><![CDATA[#[true]]]></os:value>
+        </os:store>
     </sub-flow>
-
-    <!--
-      Startup / self-heal connect: opens the Stream on deploy, and re-opens if the socket is ever gone
-      without a pending reconnect (belt-and-braces alongside reconnect-flow.xml). A short startDelay lets
-      all configs initialize first. Guarded by currentSocketOs so it never opens a second Stream while one
-      is live (which OHIP would reject with the Single-Consumer Lock, 4409).
-
-      HA: this flow is INERT when ohip.ha.enabled=true. Under HA the ha-failover-flow.xml controller owns
-      connect + status-probe + subscribe, so a blind startup connect (which would subscribe on ack and grab
-      the lock unconditionally) is exactly the behavior HA replaces. With ha.enabled=false this flow behaves
-      identically to the base opera-stream-consumer producer.
-    -->
-    <flow name="ohip-startup-connect-flow" maxConcurrency="1" doc:name="OHIP Startup Connect">
-        <scheduler doc:name="Ensure connected" doc:description="Check every 30 seconds that the stream is connected">
-            <scheduling-strategy>
-                <fixed-frequency frequency="30000" startDelay="2000" />
-            </scheduling-strategy>
-        </scheduler>
-        <os:contains key="'current-socket-id'" objectStore="currentSocketOs" target="hasSocket" doc:name="Has live socket?" doc:description="Check for an active socket" />
-        <os:contains key="'connect-in-progress'" objectStore="currentSocketOs" target="connecting" doc:name="Connect already in progress?" doc:description="Check if a connect attempt is already running" />
-        <os:contains key="'reconnect-pending'" objectStore="reconnectStateOs" target="hasPending" doc:name="Reconnect already pending?" doc:description="Check if a reconnect is already scheduled" />
-        <choice doc:name="Connect if idle (and NOT in HA mode)" doc:description="Connect only when nothing else is already trying to, and HA is off">
-            <when expression="#[(p('ohip.ha.enabled') != 'true') and not vars.hasSocket and not vars.connecting and not vars.hasPending]" doc:description="Non-HA mode and nothing connected, so open the stream on startup">
-                <logger level="INFO" doc:name="Startup connecting" doc:description="Log that startup is opening a new connection" message="No live Stream and no pending reconnect; connecting." />
-                <flow-ref name="connect-subflow" doc:name="connect-subflow" doc:description="Open the connection" />
-            </when>
-        </choice>
-    </flow>
 
     <!--
       Ordered, single-threaded intake per Oracle's single-consumer processing rule (maxConcurrency="1").
@@ -245,36 +241,27 @@ payload.expires_in]]></ee:set-variable>
         <set-variable variableName="socketId" value="#[attributes.socketId]" doc:name="Capture socket id from source" doc:description="Note which socket this frame came from" />
         <choice doc:name="Route by frame type" doc:description="Handle the frame differently based on its type">
             <when expression="#[payload.'type' == 'connection_ack']" doc:description="Server accepted the connection, so decide whether to probe status or subscribe">
-                <choice doc:name="HA? probe status before subscribing" doc:description="In HA mode check connection status first; otherwise subscribe immediately">
-                    <!--
-                      HA MODE: do NOT subscribe on ack. Per Oracle sec.7, first run the connection-status
-                      query; the ha-failover-flow controller decides whether/when to send the event subscribe
-                      based on the response. This is what keeps a standby passive while the peer is active.
-                    -->
-                    <when expression="#[p('ohip.ha.enabled') == 'true']" doc:description="HA mode, so run the connection-status query instead of subscribing immediately">
-                        <!--
-                          This socket may be either a passive status probe OR a fresh connect opened to EXECUTE
-                          a due takeover (ha-failover-controller-flow, case (a)) - the takeover no longer reuses
-                          the old probe socket (OHIP was closing it before the jittered delay elapsed; see
-                          ha-failover-flow.xml). ha-takeover-inflight (set right before that connect-subflow call)
-                          tells us which one this is.
-                        -->
-                        <os:contains key="'ha-takeover-inflight'" objectStore="haStateOs" target="isTakeoverConnect" doc:name="Is this the takeover connect?" doc:description="Distinguish a takeover connect from a routine probe" />
-                        <choice doc:name="Takeover connect? subscribe now : probe status" doc:description="A takeover connect goes straight to subscribe; a routine probe checks status first">
-                            <when expression="#[vars.isTakeoverConnect]" doc:description="This socket was opened to execute a due takeover, so subscribe immediately">
-                                <os:remove key="'ha-takeover-inflight'" objectStore="haStateOs" doc:name="Consume takeover-inflight marker" doc:description="One-shot: this ack is the takeover's own connect" />
-                                <logger level="INFO" doc:name="Log ack (HA takeover)" doc:description="Ack received on the takeover's own connect; subscribing now" message="connection_ack received (HA takeover connect); sending subscribe." />
-                                <flow-ref name="send-event-subscribe-subflow" doc:name="Send Event Subscribe" doc:description="Attempt to acquire the Single-Consumer Lock" />
-                            </when>
-                            <otherwise>
-                                <logger level="INFO" doc:name="Log ack (HA)" doc:description="Ack received; probing connection status" message="connection_ack received (HA mode); sending connection-status query." />
-                                <flow-ref name="ha-send-status-query-subflow" doc:name="Send connection-status query" doc:description="Ask OHIP whether the stream is already held" />
-                            </otherwise>
-                        </choice>
+                <!--
+                  Always HA: do NOT subscribe on ack. Per Oracle sec.7, first run the connection-status
+                  query; the ha-failover-flow controller decides whether/when to send the event subscribe
+                  based on the response. This is what keeps a standby passive while the peer is active.
+
+                  This socket may be either a passive status probe OR a fresh connect opened to EXECUTE
+                  a due takeover (ha-failover-controller-flow, case (a)). The takeover opens its own fresh
+                  socket rather than reusing the probe socket, because OHIP closes the probe socket before
+                  the jittered delay elapses (see ha-failover-flow.xml). ha-takeover-inflight (set right
+                  before that connect-subflow call) tells us which one this is.
+                -->
+                <os:contains key="'ha-takeover-inflight'" objectStore="haStateOs" target="isTakeoverConnect" doc:name="Is this the takeover connect?" doc:description="Distinguish a takeover connect from a routine probe" />
+                <choice doc:name="Takeover connect? subscribe now : probe status" doc:description="A takeover connect goes straight to subscribe; a routine probe checks status first">
+                    <when expression="#[vars.isTakeoverConnect]" doc:description="This socket was opened to execute a due takeover, so subscribe immediately">
+                        <os:remove key="'ha-takeover-inflight'" objectStore="haStateOs" doc:name="Consume takeover-inflight marker" doc:description="One-shot: this ack is the takeover's own connect" />
+                        <logger level="INFO" doc:name="Log ack (HA takeover)" doc:description="Ack received on the takeover's own connect; subscribing now" message="connection_ack received (HA takeover connect); sending subscribe." />
+                        <flow-ref name="send-event-subscribe-subflow" doc:name="Send Event Subscribe" doc:description="Attempt to acquire the Single-Consumer Lock" />
                     </when>
                     <otherwise>
-                        <logger level="INFO" doc:name="Log connection_ack" doc:description="Log that Opera accepted the connection" message="connection_ack received; sending subscribe" />
-                        <flow-ref name="send-event-subscribe-subflow" doc:name="Send Event Subscribe" doc:description="Subscribe to Business Events immediately (non-HA)" />
+                        <logger level="INFO" doc:name="Log ack" doc:description="Ack received; probing connection status" message="connection_ack received; sending connection-status query." />
+                        <flow-ref name="ha-send-status-query-subflow" doc:name="Send connection-status query" doc:description="Ask OHIP whether the stream is already held" />
                     </otherwise>
                 </choice>
             </when>
@@ -310,12 +297,12 @@ payload.expires_in]]></ee:set-variable>
                 -->
                 <!--
                   ORCHESTRATION MODE: publishes to a STANDARD queue, not FIFO. Under orchestration the consumer
-                  re-fetches current resource state on every event, so message ORDER no longer affects correctness
+                  re-fetches current resource state on every event, so message ORDER does not affect correctness
                   (a stale/reordered event just re-reads the same latest state). We therefore drop messageGroupId
                   (a FIFO-only param - meaningless on a standard queue) and gain standard-queue throughput, which
                   Oracle/our optimization notes flag as the single biggest throughput win. See the design notes.
                   messageId=uniqueEventId is KEPT: it costs nothing and lets the consumer optionally skip a
-                  redundant REST fetch for a duplicate (dedup is now an optimization, not a correctness guarantee).
+                  redundant REST fetch for a duplicate (dedup is an optimization, not a correctness guarantee).
                   For the strict-order/dedup design that used a FIFO exchange, see branch: exactly-once-ordered.
                 -->
                 <anypoint-mq:publish destination="${ohip.mq.destination}" config-ref="ohip-mq-config"

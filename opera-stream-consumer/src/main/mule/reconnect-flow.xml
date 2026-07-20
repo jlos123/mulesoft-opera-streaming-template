@@ -56,16 +56,33 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
                 <set-variable variableName="reconnectWaitMs" value="#[p('ohip.reconnect.wait4504Ms') as Number]" doc:name="Compute wait (15s)" doc:description="Wait 15 seconds before retrying" />
                 <flow-ref name="schedule-reconnect-subflow" doc:name="Schedule reconnect" doc:description="Queue up the reconnect attempt" />
             </when>
+            <!-- 1006 uses the scheduled path: abnormal closures often cluster, so a short 4s scheduled wait
+                 avoids hammering a flapping connection the way an inline retry would. -->
             <when expression="#[vars.closeCode == 1006]" doc:description="Abnormal closure, so reconnect after a brief 4s wait">
                 <logger level="INFO" doc:name="Log 1006" doc:description="Log an abnormal closure" message="Abnormal closure (1006); scheduling reconnect after 4s." />
                 <set-variable variableName="reconnectWaitMs" value="#[p('ohip.reconnect.wait1006Ms') as Number]" doc:name="Compute wait (4s)" doc:description="Wait 4 seconds before retrying" />
                 <flow-ref name="schedule-reconnect-subflow" doc:name="Schedule reconnect" doc:description="Queue up the reconnect attempt" />
             </when>
             <otherwise>
-                <logger level="INFO" doc:name="Log default close" doc:description="Log a routine close"
-                        message="Close code #[vars.closeCode] (e.g. 1000/1001); scheduling immediate reconnect." />
-                <set-variable variableName="reconnectWaitMs" value="#[p('ohip.reconnect.waitDefaultMs') as Number]" doc:name="Compute wait (0ms)" doc:description="Reconnect right away" />
-                <flow-ref name="schedule-reconnect-subflow" doc:name="Schedule reconnect" doc:description="Queue up the reconnect attempt" />
+                <!-- default/1000/1001 reconnect inline (mirroring the 4401 branch) so recovery doesn't wait a
+                     full poll interval - but ONLY for a spontaneous close. Proactive token-refresh deliberately
+                     sends `complete`, which OHIP answers with a benign 1000, and relies on its own 10s-delayed
+                     schedule-reconnect-subflow call to honor Oracle's >=10s complete->subscribe gap. If
+                     reconnect-pending is already set, that delayed reconnect owns this close - reconnecting
+                     inline here would violate the 10s gap and race a second connect against the manager's. -->
+                <os:contains key="'reconnect-pending'" objectStore="reconnectStateOs" target="hasPendingInline" doc:name="Reconnect already scheduled?" doc:description="Check if a delayed reconnect (e.g. token refresh) already owns this close" />
+                <os:contains key="'connect-in-progress'" objectStore="currentSocketOs" target="connectingInline" doc:name="Connect already in progress?" doc:description="Avoid a duplicate concurrent connect" />
+                <choice doc:name="Reconnect inline unless already scheduled or connecting" doc:description="Only connect inline if nothing else already owns the reconnect">
+                    <when expression="#[not vars.hasPendingInline and not vars.connectingInline]" doc:description="Nothing else is connecting or scheduled, so reconnect right away">
+                        <logger level="INFO" doc:name="Log default close" doc:description="Log a routine close"
+                                message="Close code #[vars.closeCode] (e.g. 1000/1001); reconnecting inline." />
+                        <flow-ref name="connect-subflow" doc:name="Reconnect now" doc:description="Reconnect immediately" />
+                    </when>
+                    <otherwise>
+                        <logger level="INFO" doc:name="Log default close deferred" doc:description="Log that a delayed reconnect already owns this close"
+                                message="Close code #[vars.closeCode] (e.g. 1000/1001); a reconnect is already scheduled or in progress, deferring to it." />
+                    </otherwise>
+                </choice>
             </otherwise>
         </choice>
     </flow>
@@ -82,15 +99,20 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
         </os:store>
     </sub-flow>
 
-    <flow name="reconnect-scheduler-flow" maxConcurrency="1" doc:name="Reconnect Scheduler">
-        <scheduler doc:name="Reconnect poll" doc:description="Poll for a due reconnect on the configured interval">
+    <!--
+      Connection manager. A single scheduler decides "should I call connect-subflow now?" on two branches:
+      a due reconnect (backoff has elapsed), and cold-start / self-heal (nothing connected). Folding both
+      into one poll keeps the idle-poll count low.
+    -->
+    <flow name="ohip-connection-manager-flow" maxConcurrency="1" doc:name="OHIP Connection Manager">
+        <scheduler doc:name="Connection manager poll" doc:description="Poll for a due reconnect, or cold-start if nothing is connected">
             <scheduling-strategy>
-                <fixed-frequency frequency="${ohip.reconnect.schedulerPollMs}" />
+                <fixed-frequency frequency="${ohip.reconnect.schedulerPollMs}" startDelay="2000" />
             </scheduling-strategy>
         </scheduler>
         <os:contains key="'reconnect-pending'" objectStore="reconnectStateOs" target="hasPending" doc:name="Has pending reconnect?" doc:description="Check if a reconnect is queued" />
         <os:contains key="'connect-in-progress'" objectStore="currentSocketOs" target="connecting" doc:name="Connect already in progress?" doc:description="Check if a connect attempt is already running" />
-        <choice doc:name="If pending and due and not already connecting" doc:description="Only act if a reconnect is queued and nothing else is connecting">
+        <choice doc:name="Reconnect due, or cold start / self-heal" doc:description="Only act if a reconnect is queued and nothing else is connecting">
             <when expression="#[vars.hasPending and not vars.connecting]" doc:description="A reconnect is queued and nothing else is connecting, so check if it's due">
                 <os:retrieve key="'reconnect-not-before-epoch-ms'" objectStore="reconnectStateOs" target="notBeforeEpochMs" doc:name="Retrieve not-before timestamp" doc:description="Load the earliest allowed retry time" />
                 <choice doc:name="If due now" doc:description="Wait until the retry time has actually arrived">
@@ -118,6 +140,15 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
                     </when>
                 </choice>
             </when>
+            <otherwise>
+                <os:contains key="'current-socket-id'" objectStore="currentSocketOs" target="hasSocket" doc:name="Has live socket?" doc:description="Check for an active socket" />
+                <choice doc:name="Cold start / self-heal if idle" doc:description="Connect only when nothing else is already trying to">
+                    <when expression="#[not vars.hasSocket and not vars.connecting and not vars.hasPending]" doc:description="Nothing is connected, connecting, or pending, so open the stream">
+                        <logger level="INFO" doc:name="Cold start / self-heal connecting" doc:description="Log that the manager is opening a new connection" message="No live Stream and no pending reconnect; connecting." />
+                        <flow-ref name="connect-subflow" doc:name="connect-subflow" doc:description="Open the connection" />
+                    </when>
+                </choice>
+            </otherwise>
         </choice>
     </flow>
 

@@ -306,8 +306,9 @@ function handleFrame(ws, data) {
       ws._eventTimer = null;
       // Real OHIP: after `complete` it drains the last events, then closes the socket itself with 1000.
       // The client must NOT close. Closing here is what fires Mule's on-socket-closed handler, which is
-      // required to observe the 10s complete->subscribe race (otherwise branch reschedules reconnect at
-      // waitDefaultMs=0). Without this close the socket lingers and the race is invisible.
+      // required to observe the 10s complete->subscribe gap: token-refresh has already set reconnect-pending,
+      // so on-socket-closed defers its inline reconnect to the 10s-delayed scheduled path (P-2). Without this
+      // close the socket lingers and that deferral is never exercised.
       ws.close(1000, 'server draining after complete');
       break;
 

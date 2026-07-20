@@ -52,8 +52,9 @@ payload.expires_in]]></ee:set-variable>
     </sub-flow>
 
     <!--
-      Shared connect-subflow: fetch token, open the Stream socket, send connection_init. Reused by the
-      tracer bullet, the reconnect state machine, and proactive token refresh.
+      Shared connect-subflow: fetch token, open the Stream socket, send connection_init. Called by
+      ohip-connection-manager-flow (cold-start + due reconnects) and ohip-on-socket-closed-flow (inline
+      reconnect for routine/4401 closes).
     -->
     <sub-flow name="connect-subflow" doc:name="Connect Subflow">
         <!--
@@ -135,39 +136,26 @@ payload.expires_in]]></ee:set-variable>
         <os:store key="'current-socket-id'" objectStore="currentSocketOs" doc:name="Store current socket id (cross-flow)" doc:description="Record the live socket ID">
             <os:value><![CDATA[#[vars.streamSocketAttributes.socketId]]]></os:value>
         </os:store>
-            <!-- Clear the marker as the LAST step of the success path (inside the try). -->
-            <os:remove key="'connect-in-progress'" objectStore="currentSocketOs" doc:name="Clear connect in-progress (success)" doc:description="Clear the connecting flag now that we're live" />
+            <!-- Clear the marker as the LAST step of the success path (inside the try). Guarded like every other remove in this app (P-4). -->
+            <os:contains key="'connect-in-progress'" objectStore="currentSocketOs" target="hasInProgressMarkerSuccess" doc:name="Has connect-in-progress marker?" doc:description="Check before clearing, matching the guarded-remove idiom" />
+            <choice doc:name="Clear if present (success)" doc:description="Only remove the marker if it's still there">
+                <when expression="#[vars.hasInProgressMarkerSuccess]" doc:description="Marker is present, so clear it">
+                    <os:remove key="'connect-in-progress'" objectStore="currentSocketOs" doc:name="Clear connect in-progress (success)" doc:description="Clear the connecting flag now that we're live" />
+                </when>
+            </choice>
             <error-handler>
                 <on-error-continue doc:name="Clear in-progress marker on failure" doc:description="Clean up the connecting flag after a failed attempt">
-                    <os:remove key="'connect-in-progress'" objectStore="currentSocketOs" doc:name="Clear connect in-progress (failure)" doc:description="Clear the connecting flag" />
+                    <os:contains key="'connect-in-progress'" objectStore="currentSocketOs" target="hasInProgressMarkerFailure" doc:name="Has connect-in-progress marker?" doc:description="Check before clearing, matching the guarded-remove idiom" />
+                    <choice doc:name="Clear if present (failure)" doc:description="Only remove the marker if it's still there">
+                        <when expression="#[vars.hasInProgressMarkerFailure]" doc:description="Marker is present, so clear it">
+                            <os:remove key="'connect-in-progress'" objectStore="currentSocketOs" doc:name="Clear connect in-progress (failure)" doc:description="Clear the connecting flag" />
+                        </when>
+                    </choice>
                     <logger level="WARN" doc:name="Log connect failure" doc:description="Log why the connect attempt failed" message="connect-subflow failed: #[error.description]" />
                 </on-error-continue>
             </error-handler>
         </try>
     </sub-flow>
-
-    <!--
-      Startup / self-heal connect: opens the Stream on deploy, and re-opens if the socket is ever gone
-      without a pending reconnect (belt-and-braces alongside reconnect-flow.xml). A short startDelay lets
-      all configs initialize first. Guarded by currentSocketOs so it never opens a second Stream while one
-      is live (which OHIP would reject with the Single-Consumer Lock, 4409).
-    -->
-    <flow name="ohip-startup-connect-flow" maxConcurrency="1" doc:name="OHIP Startup Connect">
-        <scheduler doc:name="Ensure connected" doc:description="Check every 30 seconds that the stream is connected">
-            <scheduling-strategy>
-                <fixed-frequency frequency="30000" startDelay="2000" />
-            </scheduling-strategy>
-        </scheduler>
-        <os:contains key="'current-socket-id'" objectStore="currentSocketOs" target="hasSocket" doc:name="Has live socket?" doc:description="Check for an active socket" />
-        <os:contains key="'connect-in-progress'" objectStore="currentSocketOs" target="connecting" doc:name="Connect already in progress?" doc:description="Check if a connect attempt is already running" />
-        <os:contains key="'reconnect-pending'" objectStore="reconnectStateOs" target="hasPending" doc:name="Reconnect already pending?" doc:description="Check if a reconnect is already scheduled" />
-        <choice doc:name="Connect if idle" doc:description="Connect only when nothing else is already trying to">
-            <when expression="#[not vars.hasSocket and not vars.connecting and not vars.hasPending]" doc:description="Nothing is connected or connecting, so open the stream on startup">
-                <logger level="INFO" doc:name="Startup connecting" doc:description="Log that startup is opening a new connection" message="No live Stream and no pending reconnect; connecting." />
-                <flow-ref name="connect-subflow" doc:name="connect-subflow" doc:description="Open the connection" />
-            </when>
-        </choice>
-    </flow>
 
     <!--
       Ordered, single-threaded intake per Oracle's single-consumer processing rule (maxConcurrency="1").
@@ -205,12 +193,12 @@ payload.expires_in]]></ee:set-variable>
                 -->
                 <!--
                   ORCHESTRATION MODE: publishes to a STANDARD queue, not FIFO. Under orchestration the consumer
-                  re-fetches current resource state on every event, so message ORDER no longer affects correctness
+                  re-fetches current resource state on every event, so message ORDER does not affect correctness
                   (a stale/reordered event just re-reads the same latest state). We therefore drop messageGroupId
                   (a FIFO-only param - meaningless on a standard queue) and gain standard-queue throughput, which
                   Oracle/our optimization notes flag as the single biggest throughput win. See the design notes.
                   messageId=uniqueEventId is KEPT: it costs nothing and lets the consumer optionally skip a
-                  redundant REST fetch for a duplicate (dedup is now an optimization, not a correctness guarantee).
+                  redundant REST fetch for a duplicate (dedup is an optimization, not a correctness guarantee).
                   For the strict-order/dedup design that used a FIFO exchange, see branch: exactly-once-ordered.
                 -->
                 <anypoint-mq:publish destination="${ohip.mq.destination}" config-ref="ohip-mq-config"

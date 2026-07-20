@@ -115,9 +115,9 @@ flowchart TB
 #### opera-stream-consumer
 | Flow file | Purpose |
 |---|---|
-| `connect-flow.xml` | Holds the shared `connect-subflow` (fetch OAuth token → open the Stream WebSocket → send `connection_init` → resolve and send a gap-based `subscribe`) plus `ohip-startup-connect-flow` (opens the Stream on deploy and self-heals if it's ever unexpectedly closed) and `ohip-stream-intake-flow` (the ordered, single-threaded `maxConcurrency=1` listener that routes each frame by type: `connection_ack` → subscribe, `next` → publish the Business Event to MQ, `ping` → reply `pong`). |
+| `connect-flow.xml` | Holds the shared `connect-subflow` (fetch OAuth token → open the Stream WebSocket → send `connection_init` → resolve and send a gap-based `subscribe`) and `ohip-stream-intake-flow` (the ordered, single-threaded `maxConcurrency=1` listener that routes each frame by type: `connection_ack` → subscribe, `next` → publish the Business Event to MQ, `ping` → reply `pong`). |
 | `keepalive-flow.xml` | Sends the client-initiated `ping` OHIP requires every ~15 seconds; a no-op when no socket is open. |
-| `reconnect-flow.xml` | The close-code state machine: routes each WebSocket close by its numeric code (`4401`/`4403`/`4409`/`4504`/`1006`/other) to the right reaction (reconnect now, halt, or back off and schedule a reconnect), plus the `reconnect-scheduler-flow` that polls for a due reconnect and retries `connect-subflow`. |
+| `reconnect-flow.xml` | The close-code state machine: routes each WebSocket close by its numeric code (`4401`/`4403`/`4409`/`4504`/`1006`/other) to the right reaction — immediate closes (`4401` and routine `1000`/`1001`) reconnect **inline** for ~0 latency, while genuinely delayed codes (`4409`/`4504`) back off and schedule a reconnect. Also holds `ohip-connection-manager-flow`, the single scheduler that services due scheduled reconnects **and** cold-starts / self-heals the socket — it replaces the former separate startup and reconnect-poll schedulers. |
 | `token-refresh-flow.xml` | Proactively refreshes the OAuth token before it expires — sends `complete`, waits the required 10s gap, then reconnects with a fresh token — so the Stream never has to hit the reactive `4401` path as its normal refresh mechanism. |
 | `global.xml` | Shared connector configs, cross-flow Object Stores, and the Anypoint MQ config referenced by the flows above. Swap this config (and the `publish`/`subscriber` operations that reference it) for Kafka/RabbitMQ/SQS equivalents if you'd rather use a different broker — see [Architecture Overview](#architecture-overview). |
 
@@ -133,11 +133,11 @@ flowchart TB
 
 | App | Flows | The message source in each |
 |---|---:|---|
-| `opera-stream-consumer` | **6** | `scheduler` connect-check (30s) · `scheduler` keepalive ping (15s) · `scheduler` reconnect-check (15s default) · `scheduler` token-refresh-check (30s) · `websocket:outbound-listener` stream intake · `websocket:on-socket-closed` |
-| `opera-stream-consumer-ha` | **7** | the 6 above **+** `scheduler` HA status-poll (15s) — the extra flow in `ha-failover-flow.xml` |
+| `opera-stream-consumer` | **5** | `scheduler` connection-manager: reconnect-poll + cold-start/self-heal (30s) · `scheduler` keepalive ping (15s) · `scheduler` token-refresh-check (60s) · `websocket:outbound-listener` stream intake · `websocket:on-socket-closed` |
+| `opera-stream-consumer-ha` | **5** | `scheduler` HA status-poll / failover-controller (60s) · `scheduler` keepalive ping (15s) · `scheduler` token-refresh-check (60s) · `websocket:outbound-listener` stream intake · `websocket:on-socket-closed` — the failover controller drives (re)connects, so there's no separate connect/reconnect scheduler |
 | `opera-event-orchestrator` | **1** | `anypoint-mq:subscriber` |
-| **Total (base pair)** | **7** | `opera-stream-consumer` + `opera-event-orchestrator` |
-| **Total (HA)** | **7·N + 1** | (`opera-stream-consumer-ha` × N instances) + `opera-event-orchestrator`. N is your chosen replica count summed across all regions — e.g. N=2 → 15. |
+| **Total (base pair)** | **6** | `opera-stream-consumer` + `opera-event-orchestrator` |
+| **Total (HA)** | **5·N + 1** | (`opera-stream-consumer-ha` × N instances) + `opera-event-orchestrator`. N is your chosen replica count summed across all regions — e.g. N=2 → 11. |
 
 ### Message consumption formula
 
@@ -148,7 +148,7 @@ instance:
 messages(T) ≈ scheduler_fires + websocket_frames + socket_closes + mq_events
 
 where, for the streaming app (per instance):
-  scheduler_fires   = T/30 (connect) + T/15 (ping) + T/15 (reconnect) + T/30 (token)   [+ T/15 HA poll]
+  scheduler_fires   = T/30 (connection-manager) + T/15 (ping) + T/60 (token)   [HA: T/60 status-poll instead of connection-manager]
   websocket_frames  = business_events_delivered + protocol_frames(connection_ack, ping/pong, complete)
   socket_closes     = number of disconnects in T   (one message per close)
 
@@ -160,18 +160,19 @@ for the orchestrator (per instance):
 **Idle baseline (streaming app, no events, no disconnects), messages/hour per instance:**
 
 ```
-single replica opera stream consumer configuration: 3600/30 + 3600/15 + 3600/15 + 3600/30  = 120 + 240 + 240 + 120 = 720 /hr
-HA opera stream consumer configuration  : 720 + 3600/15 (status poll)                    = 720 + 240             = 960 /hr
+single replica opera stream consumer configuration: 3600/30 (connection-manager) + 3600/15 (ping) + 3600/60 (token)  = 120 + 240 + 60 = 420 /hr
+HA opera stream consumer configuration             : 3600/60 (status poll) + 3600/15 (ping) + 3600/60 (token)        =  60 + 240 + 60 = 360 /hr
 ```
 
 Add `websocket_frames` (roughly one intake message per Business Event, plus keepalive/ack protocol
 frames) and one message per reconnect on top of that baseline. The orchestrator adds ~one message per
 Business Event it dequeues. **Multiply by instance count** — the HA variant runs **N** identical
-instances (your replica count summed across regions), so its scheduler baseline is `N × 960 /hr`
-(e.g. 2 instances → `1,920 /hr`) while only one instance holds the subscription and receives event
+instances (your replica count summed across regions), so its scheduler baseline is `N × 360 /hr`
+(e.g. 2 instances → `720 /hr`) while only one instance holds the subscription and receives event
 frames at a time.
 
-> The scheduler frequencies above are the shipped defaults (`ohip.tokenRefresh.checkIntervalMs=30000`,
-> `ohip.reconnect.schedulerPollMs=15000`, `ohip.ha.statusPollIntervalMs=15000`, and the hard-coded
-> 30s/15s schedulers). Raising any interval
-> lowers the idle message count.
+> The scheduler frequencies above are the shipped defaults (`ohip.tokenRefresh.checkIntervalMs=60000`,
+> `ohip.reconnect.schedulerPollMs=30000`, `ohip.ha.statusPollIntervalMs=60000`, and the hard-coded 15s
+> ping scheduler). Raising any interval lowers the idle message count. Note the base app's routine
+> reconnects (`4401`/`1000`/`1001`) now fire **inline** from `on-socket-closed`, so `schedulerPollMs`
+> only paces the rare `4409`/`4504` delayed reconnects and the cold-start/self-heal check.

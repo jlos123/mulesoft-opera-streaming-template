@@ -2,8 +2,7 @@
 
 A reference-quality Mule 4 application that consumes Oracle OHIP (Opera Cloud) **Business Events**
 from the OHIP **Streaming API** over a `graphql-transport-ws` WebSocket, following Oracle's
-documented best practices. Intended for internal and external Mule developers integrating with
-Opera Cloud.
+documented best practices.
 
 ## Architecture
 
@@ -162,12 +161,11 @@ have a reason to (e.g. a stricter SLA, or Oracle changes a documented timing).
 |---|---|---|
 | `ohip.reconnect.wait4409Ms` / `...JitterMaxMs` | Single-Consumer Lock (4409) reconnect wait + jitter | 2 min + up to 30s jitter |
 | `ohip.reconnect.wait4504Ms` | Service timeout (4504) reconnect wait | 15s |
-| `ohip.reconnect.waitDefaultMs` | Reconnect wait for routine closes (e.g. `1000`/`1001`) | 0ms (immediate) |
 | `ohip.reconnect.wait1006Ms` | Abnormal closure (1006) reconnect wait | 4s |
-| `ohip.reconnect.schedulerPollMs` | How often the reconnect scheduler checks for a due reconnect | 15s |
+| `ohip.reconnect.schedulerPollMs` | How often the connection-manager checks for a due reconnect (and cold-starts/self-heals). Routine closes (default/`1000`/`1001`) and 4401 reconnect inline and don't wait on this. | 30s |
 | `ohip.tokenRefresh.leadTimeMs` | How long before expiry to proactively refresh the token | 2 min |
 | `ohip.tokenRefresh.completeToSubscribeGapMs` | Minimum gap between `complete` and the next `subscribe` | 10s (Oracle's documented minimum — don't go lower) |
-| `ohip.tokenRefresh.checkIntervalMs` | How often the proactive token-refresh scheduler checks token expiry | 30s |
+| `ohip.tokenRefresh.checkIntervalMs` | How often the proactive token-refresh scheduler checks token expiry (must stay below `leadTimeMs`) | 60s |
 | `ohip.offset.persistEveryNEvents` | Checkpoint the Offset to the durable store every N events instead of per-event (events are already durable in Anypoint MQ, so a crash replays ≤N events, absorbed by the consumer's re-fetch of current state). Higher = more burst throughput + wider replay window on crash; set to `1` for per-event durability | 25 |
 
 ### Setting up Secure Properties
@@ -175,14 +173,11 @@ have a reason to (e.g. a stricter SLA, or Oracle changes a documented timing).
 1. Copy `secure.properties.sample` to `local.secure.properties` and fill in real values.
 2. Encrypt it with the [MuleSoft Secure Properties Tool](https://docs.mulesoft.com/mule-runtime/latest/secure-configuration-properties)
    using your own master key (matching `global.xml`'s `algorithm="Blowfish" mode="CBC"`), writing
-   to a separate output file (`file` mode truncates its output file before reading the input, so
-   input and output **must not** be the same path):
+   to a separate output file:
    ```
    java -cp secure-properties-tool-j17.jar com.mulesoft.tools.SecurePropertiesTool \
      file encrypt Blowfish CBC <your-master-key> local.secure.properties secure.properties
    ```
-   `local.secure.properties` is git-ignored — keep your unencrypted working copy there so you can
-   re-encrypt after edits without regenerating it from scratch.
 3. Deploy with the master key as a system property: `-Dmule.key=<your-master-key>`. For a launch
    configuration instead of the command line, see
    [Anypoint Code Builder](https://docs.mulesoft.com/anypoint-code-builder/int-run-mule-apps-with-properties#use-environment-variables-in-launch-configurations)

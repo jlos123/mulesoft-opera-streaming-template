@@ -10,10 +10,14 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
 
     <!--
       Refreshes the OAuth token before it expires so the Stream reconnects gracefully instead of hitting a
-      4401. Sends complete, then reuses reconnect-flow.xml's schedule-reconnect-subflow / reconnect-scheduler-flow
-      to honor the 10s minimum gap between complete and the next subscribe before connect-subflow re-fetches
-      a fresh token. The reactive 4401 path in reconnect-flow.xml remains as a safety net; this scheduler only
-      handles the expected case.
+      4401. Sends complete, then reuses the HA controller's own not-before gate to honor the 10s minimum
+      gap between complete and the next subscribe. Clearing ha-subscribed makes this instance passive
+      again; ha-failover-controller-flow's case (a) waits until ha-takeover-not-before elapses, then
+      reconnects with a fresh token (connect-subflow re-checks the cache, which is empty/near-expiry here
+      since the old token is about to die).
+      Safety net if this proactive refresh is ever missed: the token dies, OHIP closes with 4401, and the
+      controller simply re-probes on its next tick - connect-subflow fetches a fresh token then. This
+      scheduler handles the expected (proactive) case.
     -->
     <flow name="proactive-token-refresh-scheduler-flow" maxConcurrency="1" doc:name="Proactive Token Refresh Scheduler">
         <scheduler doc:name="Every 30s" doc:description="Check every 30 seconds if the token is about to expire">
@@ -28,9 +32,18 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
                 <choice doc:name="If within lead time of expiry" doc:description="Refresh only once the token is close to expiring">
                     <when expression="#[(now() as Number {unit: 'milliseconds'}) &gt;= (vars.expiresAtEpochMs - (p('ohip.tokenRefresh.leadTimeMs') as Number))]" doc:description="Token is within its lead time of expiring, so start a proactive refresh">
                         <os:remove key="'token-expires-at-epoch-ms'" objectStore="tokenStateOs" doc:name="Clear token expiry (avoid re-triggering)" doc:description="Clear the expiry so this doesn't refire" />
+                        <!--
+                          Only the ACTIVE HOLDER refreshes. A passive standby also tracks token-expires-at-epoch-ms
+                          and would otherwise fire here every token lifetime: it holds only a probe socket, so it
+                          would send a `complete` for a subscription it never made and then try to clear an
+                          ha-subscribed that was never set (OS:KEY_NOT_FOUND). Gating on ha-subscribed skips all
+                          of that - a standby just re-fetches lazily on its next probe connect (connect-subflow's
+                          cache check). We still confirm a live socket before sending complete.
+                        -->
+                        <os:contains key="'ha-subscribed'" objectStore="haStateOs" target="isHolder" doc:name="Do we hold the stream?" doc:description="Only the active holder has a subscription to complete" />
                         <os:contains key="'current-socket-id'" objectStore="currentSocketOs" target="hasSocket" doc:name="Has current socket?" doc:description="Check for an active socket" />
-                        <choice doc:name="If socket open" doc:description="Only refresh if a socket is actually open">
-                            <when expression="#[vars.hasSocket]" doc:description="A live socket exists, so gracefully complete it and schedule a reconnect with a fresh token">
+                        <choice doc:name="If we hold the stream on a live socket" doc:description="Only the holder completes + hands off; standbys skip">
+                            <when expression="#[vars.isHolder and vars.hasSocket]" doc:description="We hold the stream on a live socket, so gracefully complete it and hand off to the controller with a fresh token">
                                 <os:retrieve key="'current-socket-id'" objectStore="currentSocketOs" target="socketId" doc:name="Retrieve current socket id" doc:description="Load the active socket ID" />
                                 <!-- subscription id is cross-flow state; read from the store (flow vars are empty in this scheduler event). -->
                                 <os:retrieve key="'subscription-id'" objectStore="currentSocketOs" target="subscriptionId" doc:name="Retrieve subscription id" doc:description="Load the active subscription ID" />
@@ -39,9 +52,20 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
                                 <websocket:send socketId="#[vars.socketId]" config-ref="ohip-stream-ws-config" doc:name="Send complete" doc:description="Gracefully end the current subscription">
                                     <websocket:content>#[output application/json --- {id: vars.subscriptionId, 'type': "complete"}]</websocket:content>
                                 </websocket:send>
-                                <set-variable variableName="reconnectWaitMs" value="#[p('ohip.tokenRefresh.completeToSubscribeGapMs') as Number]"
-                                              doc:name="Compute wait (10s complete-to-subscribe gap)" doc:description="Wait 10 seconds before resubscribing" />
-                                <flow-ref name="schedule-reconnect-subflow" doc:name="Schedule reconnect" doc:description="Queue up the reconnect with a fresh token" />
+                                <!--
+                                  Hand off to the controller's not-before gate: clear ha-subscribed so this
+                                  instance is passive again, and set ha-takeover-not-before 10s out so
+                                  ha-failover-controller-flow's case (a) won't reconnect/resubscribe before the
+                                  Oracle-mandated gap elapses.
+                                  Guarded remove: the `complete` we just sent makes OHIP close the socket, which
+                                  fires ohip-on-socket-closed-flow - it also clears ha-subscribed and can win the
+                                  race, so an unconditional remove here would throw OS:KEY_NOT_FOUND.
+                                -->
+                                <os:contains key="'ha-subscribed'" objectStore="haStateOs" target="stillHolder" doc:name="Still holding?" doc:description="Guard against on-socket-closed clearing it first" />
+                                <choice doc:name="Clear ha-subscribed if still present"><when expression="#[vars.stillHolder]" doc:description="Still set, so clear it - we sent complete and no longer hold the stream"><os:remove key="'ha-subscribed'" objectStore="haStateOs" doc:name="Clear ha-subscribed" doc:description="We just sent complete; we no longer hold the stream" /></when></choice>
+                                <os:store key="'ha-takeover-not-before'" objectStore="haStateOs" doc:name="Set takeover not-before (10s gap)" doc:description="Earliest time the controller may resubscribe">
+                                    <os:value><![CDATA[#[(now() as Number {unit: 'milliseconds'}) + (p('ohip.tokenRefresh.completeToSubscribeGapMs') as Number)]]]></os:value>
+                                </os:store>
                             </when>
                         </choice>
                     </when>

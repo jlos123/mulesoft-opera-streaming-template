@@ -10,7 +10,7 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
 
     <!--
       Refreshes the OAuth token before it expires so the Stream reconnects gracefully instead of hitting a
-      4401. Sends complete, then reuses reconnect-flow.xml's schedule-reconnect-subflow / reconnect-scheduler-flow
+      4401. Sends complete, then reuses reconnect-flow.xml's schedule-reconnect-subflow / ohip-connection-manager-flow
       to honor the 10s minimum gap between complete and the next subscribe before connect-subflow re-fetches
       a fresh token. The reactive 4401 path in reconnect-flow.xml remains as a safety net; this scheduler only
       handles the expected case.

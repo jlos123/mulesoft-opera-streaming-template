@@ -26,8 +26,9 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
            ha-takeover-inflight). OHIP was observed force-closing the status-probe socket within
            ~20-400ms of the status reply - well before the jittered delay elapses - so the probe
            socket cannot be relied on to still be open when the takeover fires.
-        4. whoever's subscribe lands first wins the Single-Consumer Lock; the losers get 4409 and
-           the base reconnect-flow backs off (2min+jitter) and re-probe.
+        4. whoever's subscribe lands first wins the Single-Consumer Lock; a loser gets 4409, OHIP closes
+           its socket (which clears ha-subscribed via on-socket-closed), and this same controller re-probes
+           on its next tick - now sees Active and stands down. The poll interval is the sole retry cadence.
 
       The lock (4409) is enforced by OHIP on the SUBSCRIBE, not on the socket - so every instance
       can hold a socket + poll status simultaneously without conflict, and OHIP itself is the
@@ -39,8 +40,7 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
       instance; failover works the same whether the winner was a same-region replica or a
       cross-region deployment.
 
-      Every flow here is gated on ohip.ha.enabled=='true'. With HA disabled the schedulers no-op and
-      the app behaves exactly like the base producer (ohip-startup-connect-flow drives it instead).
+      This controller runs unconditionally - HA is the only mode this app has.
     -->
 
     <!--
@@ -56,8 +56,8 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
       ohip-on-socket-closed-flow) that can run concurrently. If the close-handler's os:remove wins that
       race, current-socket-id is already gone by the time this subflow runs - guarded here (rather than
       requiring the caller to guarantee a live socket) so that lost race degrades to a harmless no-op
-      instead of an unhandled OS:KEY_NOT_FOUND. The controller's own poller (or the close-handler's
-      reconnect scheduling) drives the next attempt regardless.
+      instead of an unhandled OS:KEY_NOT_FOUND. The controller's own poller drives the next attempt
+      regardless (the socket close cleared ha-subscribed, so the next tick re-probes).
     -->
     <sub-flow name="ha-send-status-query-subflow" doc:name="HA Send Status Query">
         <os:contains key="'current-socket-id'" objectStore="currentSocketOs" target="hasSocket" doc:name="Has live socket?" doc:description="Check the probe socket is still tracked before using it" />
@@ -130,9 +130,9 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
     <!--
       The failover poller. Fires every ohip.ha.statusPollIntervalMs. Only meaningful while this instance
       is PASSIVE (not holding the stream). It drives the probe socket, re-polls status, and executes a
-      due takeover. When this instance is active (ha-subscribed) it no-ops - the base keepalive/token
-      refresh/reconnect flows keep the live subscription healthy, and on-socket-closed clears ha-subscribed
-      to make this poller take over again.
+      due takeover. When this instance is active (ha-subscribed) it no-ops - the keepalive ping and
+      proactive token-refresh flows keep the live subscription healthy, and on-socket-closed clears
+      ha-subscribed to make this poller take over again.
     -->
     <flow name="ha-failover-controller-flow" maxConcurrency="1" doc:name="HA Failover Controller">
         <scheduler doc:name="Poll" doc:description="Re-check status / drive takeover on the HA poll interval">
@@ -140,36 +140,45 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
                 <fixed-frequency frequency="${ohip.ha.statusPollIntervalMs}" startDelay="3000" />
             </scheduling-strategy>
         </scheduler>
-        <choice doc:name="Only in HA mode" doc:description="No-op unless ohip.ha.enabled=true">
-            <when expression="#[p('ohip.ha.enabled') == 'true']" doc:description="HA is enabled, so run the failover state machine">
-                <os:retrieve key="'ha-subscribed'" objectStore="haStateOs" target="haSubscribed" doc:name="Am I active (hold stream)?" doc:description="True if this instance holds the subscription">
-                    <os:default-value><![CDATA[#[false]]]></os:default-value>
-                </os:retrieve>
-                <choice doc:name="Act only while passive" doc:description="Do nothing while we hold the stream">
-                    <when expression="#[not vars.haSubscribed]" doc:description="We don't hold the stream, so probe, poll, or take over as needed">
-                        <os:contains key="'current-socket-id'" objectStore="currentSocketOs" target="hasSocket" doc:name="Has probe socket?" doc:description="Is a socket open to query on" />
-                        <os:contains key="'connect-in-progress'" objectStore="currentSocketOs" target="connecting" doc:name="Connect in progress?" doc:description="A connect attempt is already running" />
-                        <os:contains key="'reconnect-pending'" objectStore="reconnectStateOs" target="hasPending" doc:name="Reconnect pending?" doc:description="A backoff reconnect is queued (e.g. after 4409)" />
-                        <os:contains key="'ha-takeover-not-before'" objectStore="haStateOs" target="hasTakeover" doc:name="Takeover scheduled?" doc:description="Are we waiting to subscribe" />
-                        <choice doc:name="Passive state machine" doc:description="Probe -> poll -> take over">
-                            <!--
+        <!--
+          4403 halt: a config-fatal close means retrying is pointless - stop opening probe sockets entirely
+          until restarted/redeployed with a fixed chainCode/app key. Checked first, before the rest of the
+          state machine, so a halted instance truly no-ops every tick. The flag lives in the non-persistent
+          haStateOs, so a restart or redeploy clears it (a 4403 is fixed in OHIP, not here).
+        -->
+        <os:contains key="'halted'" objectStore="haStateOs" target="isHalted" doc:name="Halted (4403)?" doc:description="Check the config-fatal halt flag" />
+        <choice doc:name="Skip entirely if halted" doc:description="4403 halt takes priority over everything else">
+            <when expression="#[vars.isHalted]" doc:description="Config-fatal condition flagged; do not probe">
+                <logger level="ERROR" doc:name="Log halted" doc:description="Remind that this instance is halted on a config error" message="Halted (4403 chain/app-key config error observed); not probing. Fix config and redeploy to resume." />
+            </when>
+            <otherwise>
+        <os:retrieve key="'ha-subscribed'" objectStore="haStateOs" target="haSubscribed" doc:name="Am I active (hold stream)?" doc:description="True if this instance holds the subscription">
+            <os:default-value><![CDATA[#[false]]]></os:default-value>
+        </os:retrieve>
+        <choice doc:name="Act only while passive" doc:description="Do nothing while we hold the stream">
+            <when expression="#[not vars.haSubscribed]" doc:description="We don't hold the stream, so probe, poll, or take over as needed">
+                <os:contains key="'current-socket-id'" objectStore="currentSocketOs" target="hasSocket" doc:name="Has probe socket?" doc:description="Is a socket open to query on" />
+                <os:contains key="'connect-in-progress'" objectStore="currentSocketOs" target="connecting" doc:name="Connect in progress?" doc:description="A connect attempt is already running" />
+                <os:contains key="'ha-takeover-not-before'" objectStore="haStateOs" target="hasTakeover" doc:name="Takeover scheduled?" doc:description="Are we waiting to subscribe" />
+                <choice doc:name="Passive state machine" doc:description="Probe -> poll -> take over">
+                    <!--
                               (a) Takeover is due -> open a FRESH connect and subscribe on ITS OWN ack, rather
                               than sending subscribe on the old probe socket. OHIP was observed force-closing the
                               probe socket (close code 1000) within ~20-400ms of the status reply, almost always
                               before the 1-5s jittered delay elapses - so by the time this poller next runs
-                              (every ohip.ha.statusPollIntervalMs, default 15s), the probe socket is already
+                              (every ohip.ha.statusPollIntervalMs, default 60s), the probe socket is already
                               gone. Deliberately does NOT require vars.hasSocket: connect-subflow opens its own
                               socket regardless, and the connector already force-closes any stale same-id socket
                               first (see SocketRegistry "Replacing stale WebSocket" in the logs). ha-takeover-
                               inflight tells connect-flow.xml's ack router to subscribe immediately on this
                               connect instead of re-probing status. Guarded on not-connecting so this doesn't
-                              fire a duplicate connect-subflow on top of one already underway from case (b) or
-                              from reconnect-scheduler-flow's own close-code-driven reconnect; if skipped for
-                              that reason, the still-scheduled takeover is simply retried on the next poll tick.
+                              fire a duplicate connect-subflow on top of one already underway from case (b).
+                              If skipped for that reason, the still-scheduled takeover is simply retried on
+                              the next poll tick.
                             -->
                             <when expression="#[vars.hasTakeover and not vars.connecting]" doc:description="Takeover is scheduled and nothing else is already connecting, so reconnect and subscribe once it's due">
                                 <os:retrieve key="'ha-takeover-not-before'" objectStore="haStateOs" target="notBefore" doc:name="Load takeover not-before" doc:description="Earliest allowed subscribe time" />
-                                <choice doc:name="If takeover due" doc:description="Wait out the role-biased delay">
+                                <choice doc:name="If takeover due" doc:description="Wait out the symmetric jittered delay">
                                     <when expression="#[(now() as Number {unit: 'milliseconds'}) &gt;= (vars.notBefore as Number)]" doc:description="Takeover delay has elapsed, so reconnect and subscribe now">
                                         <os:remove key="'ha-takeover-not-before'" objectStore="haStateOs" doc:name="Consume takeover schedule" doc:description="Clear so we don't re-fire" />
                                         <os:store key="'ha-takeover-inflight'" objectStore="haStateOs" doc:name="Mark takeover connect inflight" doc:description="Tell the ack router to subscribe immediately on this connect">
@@ -189,7 +198,7 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
                               connect-subflow opens it and sends connection_init; the ack handler then fires the
                               first connection-status query automatically.
                             -->
-                            <when expression="#[not vars.hasSocket and not vars.connecting and not vars.hasPending]" doc:description="No socket and nothing else connecting, so open a probe socket">
+                            <when expression="#[not vars.hasSocket and not vars.connecting]" doc:description="No socket and nothing else connecting, so open a probe socket">
                                 <logger level="INFO" doc:name="Log opening probe" doc:description="Opening a probe socket to check status" message="Passive and no socket; opening probe socket to check connection status." />
                                 <flow-ref name="connect-subflow" doc:name="connect-subflow" doc:description="Open socket + connection_init (ack triggers first status query)" />
                             </when>
@@ -208,8 +217,10 @@ http://www.mulesoft.org/schema/mule/websocket http://www.mulesoft.org/schema/mul
                         <logger level="DEBUG" doc:name="Active - poller idle" doc:description="We hold the stream; nothing to do" message="This instance holds the stream (active); failover poller idle." />
                     </otherwise>
                 </choice>
-            </when>
+            </otherwise>
         </choice>
     </flow>
 
 </mule>
+
+
